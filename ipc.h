@@ -30,7 +30,14 @@
 #define IPC_TX_PATH   "/tmp/pqc_tx.sock"   /* server_tx → server       */
 
 /* ── Shared capacity constant ────────────────────────────────────── */
-#define MAX_CLIENTS   32
+/*
+ * MAX_CLIENTS can be overridden at compile time:
+ *   gcc -DMAX_CLIENTS=128 ...
+ * Default: 256 (supports up to 256 concurrent PQC sessions)
+ */
+#ifndef MAX_CLIENTS
+#define MAX_CLIENTS   4096
+#endif
 
 /* ── Frame types ─────────────────────────────────────────────────── */
 #define IPC_MSG_RX          0x01  /* inbound message from a client      */

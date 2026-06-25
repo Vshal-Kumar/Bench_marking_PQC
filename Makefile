@@ -22,6 +22,7 @@
 #         -DOQS_ENABLE_SIG_ml_dsa_65=ON \
 #         -DOQS_USE_AVX2_INSTRUCTIONS=ON \
 #         -DBUILD_SHARED_LIBS=OFF
+
 #   cmake --build liboqs/build_x86_64 -j$(nproc)
 #
 # Usage (three terminals on the server machine):
@@ -32,10 +33,12 @@
 
 CC      = gcc
 ARCH    = x86_64s
-LIBOQS  = liboqs/build_x86_64_nosimd
+LIBOQS  = liboqs/build
 
-INC     = -I. -I$(LIBOQS)/include
-LIBS    = $(LIBOQS)/lib/liboqs.a -lssl -lcrypto -lpthread -lm
+LIBURING_LOCAL = liburing_local
+
+INC     = -I. -I$(LIBOQS)/include -I$(LIBURING_LOCAL)/include
+LIBS    = $(LIBOQS)/lib/liboqs.a $(LIBURING_LOCAL)/lib/liburing.a -lssl -lcrypto -lpthread -lm
 
 # ── Compiler flags ───────────────────────────────────────────────
 OPT     = -O3 -march=native -mtune=native -funroll-loops \
@@ -70,10 +73,10 @@ SHARED_OBJS = transport.o crypto/aead.o \
 
 SERVER_OBJS = $(SHARED_OBJS) client_registry.o
 
-.PHONY: all server server_rx server_tx bench_pqc clean \
-        run-server run-rx run-tx run-bench
+.PHONY: all server server_rx server_tx bench_pqc bench_nclient clean \
+        run-server run-rx run-tx run-bench run-nclient
 
-all: server server_rx server_tx bench_pqc
+all: server server_rx server_tx bench_pqc bench_nclient
 
 # ── Server (multi-client core) ───────────────────────────────────
 server: server.c $(SERVER_OBJS)
@@ -90,10 +93,15 @@ server_tx: server_tx.c transport.o
 	$(CC) $(CFLAGS) -o $@ $^ -lpthread -lm $(LDFLAGS)
 	@echo "Built: server_tx (sender terminal)"
 
-# ── Benchmark ────────────────────────────────────────────────────
+# ── Benchmark (primitives) ───────────────────────────────────────
 bench_pqc: bench_pqc.c $(SHARED_OBJS)
 	$(CC) $(OPT) $(LTO) $(WARN) $(DEFS) $(INC) -o $@ $^ $(LIBS) $(LDFLAGS) -lm
 	@echo "Built: bench_pqc (x86_64)"
+
+# ── Benchmark (N-client concurrent handshake) ────────────────────
+bench_nclient: bench_nclient.c $(SHARED_OBJS)
+	$(CC) $(OPT) $(LTO) $(WARN) $(DEFS) $(INC) -o $@ $^ $(LIBS) $(LDFLAGS) -lm
+	@echo "Built: bench_nclient (x86_64)"
 
 # ── Run targets ──────────────────────────────────────────────────
 run-server: server
@@ -108,9 +116,12 @@ run-tx: server_tx
 run-bench: bench_pqc
 	./bench_pqc
 
+run-nclient: bench_nclient
+	./bench_nclient
+
 # ── Clean ────────────────────────────────────────────────────────
 clean:
-	rm -f server server_rx server_tx bench_pqc \
+	rm -f server server_rx server_tx bench_pqc bench_nclient \
 	      transport.o client_registry.o \
 	      crypto/aead.o \
 	      wrappers/kem_wrapper.o wrappers/dsa_wrapper.o

@@ -1,1045 +1,1291 @@
 /*
- * server.c — PQC Multi-Client Chat Server
+ * server.c — High-Performance Asynchronous io_uring PQC Multi-Client Chat
+ * Server
  *
  * Project: Performance Evaluation of SIMD-Accelerated Post-Quantum
  *          Cryptography on Embedded ARM Platforms
  *
  * Architecture:
- *
- *  Main thread       : UDP accept loop on port 9877
- *                      - Peeks at each datagram
- *                      - Routes PKT_DATA to the correct registered client
- *                      - Spawns session_thread for new CLIENT_HELLO peers
- *  session_thread    : PQC 4-way handshake using the SHARED listen socket
- *                      (the client only knows port 9877 — we never change ports)
- *  client_rx_thread  : continuous RX loop per established client,
- *                      also reads from the shared socket (peer-filtered)
- *  ipc_rx_thread     : holds UNIX socket to server_rx terminal
- *  ipc_tx_thread     : holds UNIX socket to server_tx terminal, dispatches sends
- *
- * Key design decisions:
- *  - ALL traffic uses a SINGLE UDP socket on port 9877.
- *    The client never learns a different port — it sends everything to 9877.
- *  - Per-client demux is done by comparing recvfrom() peer address.
- *  - A per-client recv pipe (socketpair) lets the main dispatch thread
- *    hand pre-read datagrams to the correct client_rx_thread without
- *    races. The session_thread and client_rx_thread read from their pipe;
- *    the main thread writes to it after filtering by peer addr.
- *
- * Packet wire format (PKT_DATA — simplified vs original):
- *   NONCE(12) | TAG(16) | CIPHERTEXT(n)   — no net_metrics_t prefix
- *
- * 4-Way PQC Handshake (unchanged):
- *  Phase 1  <- CLIENT_HELLO : client_KEM_PK || client_DSA_PK
- *  Phase 2  -> SERVER_HELLO : server_KEM_PK || server_DSA_PK || KEM_CT || SID
- *  Phase 3  <- CLIENT_AUTH  : DSA_sig(SID || server_DSA_PK || SS)
- *  Phase 4  -> session active
+ *  - Core 1: Network Event Loop (Main Thread)
+ *            - io_uring asynchronous UDP engine (Zero-copy/pre-allocated
+ * buffers)
+ *            - Thread-confined session table (Actor model style, no locks)
+ *            - Synchronous polling of io_uring CQ & lock-free Completion Queue
+ *            - Adaptive load controller & rate limiting
+ *  - Cores 2-7: Crypto Worker Thread Pool
+ *            - Dequeue jobs from lock-free SPMC Queue
+ *            - Execute heavy ML-KEM encapsulation & ML-DSA verification
+ *            - Push completion to lock-free MPSC Queue
+ *  - Core 8: Warm-path (KEM Keypair pre-generator, IPC terminals)
  */
 
-#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
 
+#include <arpa/inet.h>
+#include <liburing.h>
+#include <netinet/in.h>
+#include <openssl/rand.h>
+#include <poll.h>
+#include <pthread.h>
+#include <sched.h>
+#include <semaphore.h>
+#include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdint.h>
-#include <unistd.h>
-#include <signal.h>
-#include <poll.h>
-#include <pthread.h>
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <openssl/rand.h>
+#include <unistd.h>
 
-#include "transport.h"
-#include "crypto/aead.h"
-#include "wrappers/kem_wrapper.h"
-#include "wrappers/dsa_wrapper.h"
 #include "client_registry.h"
+#include "crypto/aead.h"
 #include "ipc.h"
+#include "transport.h"
+#include "wrappers/dsa_wrapper.h"
+#include "wrappers/kem_wrapper.h"
 
-#define AUTH_CTX_LEN  (SESSION_ID_BYTES + DSA_PK_BYTES + KEM_SS_BYTES)
+/* ── Sizing and Bounds ───────────────────────────────────────────── */
+#define MAX_SESSIONS 10000
+#define SESSION_HASH_SIZE (MAX_SESSIONS * 2)
+#define JOB_QUEUE_SIZE 4096
+#define COMP_QUEUE_SIZE 4096
+#define NUM_RECV_BUFFERS 1024
+#define NUM_WORKERS 3
+#define RATE_LIMIT_HASH_SIZE 2048
 
-/* ── Max raw datagram we ever dispatch through a pipe ────────────── */
-#define PIPE_PKT_MAX  (PKT_HDR_BYTES + KEM_PK_BYTES + DSA_PK_BYTES + \
-                       KEM_CT_BYTES + SESSION_ID_BYTES + DSA_SIG_BYTES + \
-                       12 + 16 + DATA_CHUNK_MAX + 64)
+#define AUTH_CTX_LEN (SESSION_ID_BYTES + DSA_PK_BYTES + KEM_SS_BYTES)
 
-/* ── Long-term server identity ───────────────────────────────────── */
+/* ── Long-term identity ──────────────────────────────────────────── */
 static uint8_t g_srv_dsa_pk[DSA_PK_BYTES];
 static uint8_t g_srv_dsa_sk[DSA_SK_BYTES];
-static double  g_dsa_keygen_ms = 0.0;
+static double g_dsa_keygen_ms = 0.0;
 
-/* ── Pre-generated ephemeral KEM cache ───────────────────────────── */
-static uint8_t         g_srv_kem_pk[KEM_PK_BYTES];
-static uint8_t         g_srv_kem_sk[KEM_SK_BYTES];
-static double          g_kem_keygen_ms  = 0.0;
-static int             g_kem_cache_valid = 0;
-static pthread_mutex_t g_kem_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t  g_kem_ready = PTHREAD_COND_INITIALIZER;
+/* Ephemeral KEM PK removed to optimize bandwidth (no longer sent in
+ * SERVER_HELLO) */
 
-/* ── Global stop ─────────────────────────────────────────────────── */
-static volatile int    g_stop = 0;
-static void on_signal(int s) { (void)s; g_stop = 1; }
+static volatile int g_stop = 0;
+static void on_signal(int s) {
+  (void)s;
+  g_stop = 1;
+}
 
-/* ── Shared listen socket (all clients use port 9877) ────────────── */
+static void make_nonce(uint8_t nonce[12], uint64_t ctr) {
+  uint64_t le_ctr = ctr;
+  memcpy(nonce, &le_ctr, 8);
+  memset(nonce + 8, 0, 4);
+}
+
 static int g_listen_sock = -1;
-/* Mutex for sends on the shared socket (multiple threads send ACKs/data) */
 static pthread_mutex_t g_sock_send_mu = PTHREAD_MUTEX_INITIALIZER;
 
-/* ── IPC connections ─────────────────────────────────────────────── */
-static int             g_ipc_rx_fd = -1;
-static int             g_ipc_tx_fd = -1;
+static int g_ipc_rx_fd = -1;
+static int g_ipc_tx_fd = -1;
 static pthread_mutex_t g_ipc_rx_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_ipc_tx_mu = PTHREAD_MUTEX_INITIALIZER;
 
-/* ════════════════════════════════════════════════════════════════════
- * Per-client dispatch pipe
- *
- * The main accept/dispatch loop reads every datagram from the shared
- * socket and writes it into the matching client's pipe.
- * Each session_thread / client_rx_thread reads from its own pipe end.
- *
- * Wire format inside the pipe (length-prefixed raw datagram):
- *   uint16_t total_len | uint8_t data[total_len]
- * ════════════════════════════════════════════════════════════════════ */
+/* ── Queue Definitions ───────────────────────────────────────────── */
+typedef struct {
+  uint64_t job_id;
+  uint32_t session_id;
+  uint64_t generation;
+  uint8_t type;
 
-#define DISPATCH_PIPE_MAX  MAX_CLIENTS
+  /* Input payload pointers (zero-copy addresses) */
+  const uint8_t *client_kem_pk;
+  const uint8_t *client_dsa_pk;
+  const uint8_t *sig;
+  uint32_t sig_len;
+  const uint8_t *auth_ctx;
+
+  /* Output payload pointers (zero-copy addresses) */
+  uint8_t *kem_ct;
+  uint8_t *session_key;
+} crypto_job_t;
 
 typedef struct {
-    int      write_fd;   /* main thread writes here */
-    int      read_fd;    /* session/rx thread reads here */
-    uint32_t ip;         /* network byte order */
-    uint16_t port;       /* network byte order */
-    int      used;
-    pthread_mutex_t mu;  /* protects write_fd */
-} dispatch_pipe_t;
+  uint64_t job_id;
+  uint32_t session_id;
+  uint64_t generation;
+  uint8_t type;
+  int status;
+} crypto_completion_t;
 
-static dispatch_pipe_t g_pipes[DISPATCH_PIPE_MAX];
-static pthread_mutex_t g_pipes_mu = PTHREAD_MUTEX_INITIALIZER;
+typedef struct {
+  crypto_job_t jobs[JOB_QUEUE_SIZE];
+  unsigned long head;
+  unsigned long tail;
+} crypto_job_queue_t;
 
-static int dispatch_alloc(uint32_t ip, uint16_t port)
-{
-    pthread_mutex_lock(&g_pipes_mu);
-    for (int i = 0; i < DISPATCH_PIPE_MAX; i++) {
-        if (!g_pipes[i].used) {
-            int fds[2];
-            if (pipe(fds) < 0) {
-                pthread_mutex_unlock(&g_pipes_mu);
-                return -1;
-            }
-            g_pipes[i].read_fd  = fds[0];
-            g_pipes[i].write_fd = fds[1];
-            g_pipes[i].ip       = ip;
-            g_pipes[i].port     = port;
-            g_pipes[i].used     = 1;
-            pthread_mutex_unlock(&g_pipes_mu);
-            return i;
-        }
+typedef struct {
+  crypto_completion_t completions[COMP_QUEUE_SIZE];
+  unsigned char ready[COMP_QUEUE_SIZE];
+  unsigned long head;
+  unsigned long tail;
+} completion_queue_t;
+
+static crypto_job_queue_t g_job_queue;
+static completion_queue_t g_comp_queue;
+static sem_t g_job_sem;
+static int g_in_flight_jobs = 0;
+
+/* ── Lock-free Queue Operations ──────────────────────────────────── */
+static int push_job(const crypto_job_t *job) {
+  unsigned long tail = g_job_queue.tail;
+  unsigned long head = __atomic_load_n(&g_job_queue.head, __ATOMIC_ACQUIRE);
+  if (tail - head >= JOB_QUEUE_SIZE) {
+    return -1; /* Queue full */
+  }
+  g_job_queue.jobs[tail % JOB_QUEUE_SIZE] = *job;
+  __atomic_store_n(&g_job_queue.tail, tail + 1, __ATOMIC_RELEASE);
+  __atomic_add_fetch(&g_in_flight_jobs, 1, __ATOMIC_SEQ_CST);
+  sem_post(&g_job_sem);
+  return 0;
+}
+
+static int pop_job(crypto_job_t *job_out) {
+  unsigned long head;
+  while (1) {
+    head = __atomic_load_n(&g_job_queue.head, __ATOMIC_ACQUIRE);
+    unsigned long tail = __atomic_load_n(&g_job_queue.tail, __ATOMIC_ACQUIRE);
+    if (head == tail) {
+      return -1; /* Queue empty */
     }
-    pthread_mutex_unlock(&g_pipes_mu);
+    if (__atomic_compare_exchange_n(&g_job_queue.head, &head, head + 1, 1,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+      *job_out = g_job_queue.jobs[head % JOB_QUEUE_SIZE];
+      return 0;
+    }
+  }
+}
+
+static int push_completion(const crypto_completion_t *comp) {
+  unsigned long tail;
+  while (1) {
+    tail = __atomic_load_n(&g_comp_queue.tail, __ATOMIC_ACQUIRE);
+    unsigned long head = __atomic_load_n(&g_comp_queue.head, __ATOMIC_ACQUIRE);
+    if (tail - head >= COMP_QUEUE_SIZE) {
+      return -1; /* Queue full */
+    }
+    if (__atomic_compare_exchange_n(&g_comp_queue.tail, &tail, tail + 1, 1,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+      break;
+    }
+  }
+  unsigned long idx = tail % COMP_QUEUE_SIZE;
+  g_comp_queue.completions[idx] = *comp;
+  __atomic_store_n(&g_comp_queue.ready[idx], 1, __ATOMIC_RELEASE);
+  return 0;
+}
+
+static int pop_completion(crypto_completion_t *comp_out) {
+  unsigned long head = g_comp_queue.head;
+  unsigned long tail = __atomic_load_n(&g_comp_queue.tail, __ATOMIC_ACQUIRE);
+  if (head == tail)
+    return -1; /* Queue empty */
+  unsigned long idx = head % COMP_QUEUE_SIZE;
+  if (!__atomic_load_n(&g_comp_queue.ready[idx], __ATOMIC_ACQUIRE)) {
+    return -1; /* Write in progress */
+  }
+  *comp_out = g_comp_queue.completions[idx];
+  __atomic_store_n(&g_comp_queue.ready[idx], 0, __ATOMIC_RELEASE);
+  g_comp_queue.head = head + 1;
+  __atomic_sub_fetch(&g_in_flight_jobs, 1, __ATOMIC_SEQ_CST);
+  return 0;
+}
+
+/* ── Session States ──────────────────────────────────────────────── */
+typedef enum {
+  SESSION_FREE,
+  SESSION_WAIT_KEM_ENC,
+  SESSION_WAIT_AUTH,
+  SESSION_WAIT_AUTH_VER,
+  SESSION_ESTABLISHED
+} session_state_t;
+
+typedef struct {
+  uint32_t session_id;
+  uint64_t generation;
+  uint32_t ip;
+  uint16_t port;
+  uint8_t state;
+
+  uint8_t client_kem_pk[KEM_PK_BYTES];
+  uint8_t client_dsa_pk[DSA_PK_BYTES];
+  uint8_t kem_ct[KEM_CT_BYTES];
+  uint8_t session_key[KEM_SS_BYTES];
+  uint8_t sig[DSA_SIG_BYTES];
+  uint8_t auth_ctx[AUTH_CTX_LEN];
+  uint64_t session_id_val;
+
+  uint32_t rx_seq;
+  uint32_t tx_seq;
+  uint64_t tx_nonce_ctr;
+
+  uint64_t current_job_id;
+  metrics_t metrics;
+  uint64_t last_seen_ns;
+  uint64_t established_time_ns;
+  int client_registry_id;
+} session_t;
+
+static session_t g_sessions[MAX_SESSIONS] __attribute__((aligned(64)));
+static uint32_t g_free_sessions[MAX_SESSIONS];
+static int g_free_session_count = MAX_SESSIONS;
+
+typedef struct {
+  uint32_t ip;
+  uint16_t port;
+  uint32_t session_idx;
+  int occupied;
+} session_hash_entry_t;
+
+static session_hash_entry_t g_session_hash[SESSION_HASH_SIZE];
+
+/* ── Hash Map Operations ─────────────────────────────────────────── */
+static inline uint32_t session_hash(uint32_t ip, uint16_t port) {
+  uint32_t h = 2166136261u;
+  const uint8_t *b = (const uint8_t *)&ip;
+  for (int i = 0; i < 4; i++) {
+    h ^= b[i];
+    h *= 16777619u;
+  }
+  h ^= (uint8_t)(port & 0xFF);
+  h *= 16777619u;
+  h ^= (uint8_t)(port >> 8);
+  h *= 16777619u;
+  return h;
+}
+
+static void session_hash_insert(uint32_t ip, uint16_t port, uint32_t idx) {
+  uint32_t h = session_hash(ip, port) % SESSION_HASH_SIZE;
+  for (int i = 0; i < SESSION_HASH_SIZE; i++) {
+    int slot = (int)((h + (uint32_t)i) % SESSION_HASH_SIZE);
+    if (!g_session_hash[slot].occupied) {
+      g_session_hash[slot].ip = ip;
+      g_session_hash[slot].port = port;
+      g_session_hash[slot].session_idx = idx;
+      g_session_hash[slot].occupied = 1;
+      return;
+    }
+  }
+}
+
+static int session_hash_lookup(uint32_t ip, uint16_t port) {
+  uint32_t h = session_hash(ip, port) % SESSION_HASH_SIZE;
+  for (int i = 0; i < SESSION_HASH_SIZE; i++) {
+    int slot = (int)((h + (uint32_t)i) % SESSION_HASH_SIZE);
+    if (!g_session_hash[slot].occupied)
+      return -1;
+    if (g_session_hash[slot].ip == ip && g_session_hash[slot].port == port)
+      return (int)g_session_hash[slot].session_idx;
+  }
+  return -1;
+}
+
+static void session_hash_remove(uint32_t ip, uint16_t port) {
+  uint32_t h = session_hash(ip, port) % SESSION_HASH_SIZE;
+  int found = -1;
+  for (int i = 0; i < SESSION_HASH_SIZE; i++) {
+    int slot = (int)((h + (uint32_t)i) % SESSION_HASH_SIZE);
+    if (!g_session_hash[slot].occupied)
+      return;
+    if (g_session_hash[slot].ip == ip && g_session_hash[slot].port == port) {
+      found = slot;
+      break;
+    }
+  }
+  if (found < 0)
+    return;
+
+  int empty = found;
+  g_session_hash[empty].occupied = 0;
+  for (int i = 1; i < SESSION_HASH_SIZE; i++) {
+    int slot = (empty + i) % SESSION_HASH_SIZE;
+    if (!g_session_hash[slot].occupied)
+      break;
+    uint32_t ideal =
+        session_hash(g_session_hash[slot].ip, g_session_hash[slot].port) %
+        SESSION_HASH_SIZE;
+    int needs_shift = 0;
+    if (empty < slot)
+      needs_shift = (int)(ideal <= (uint32_t)empty || ideal > (uint32_t)slot);
+    else
+      needs_shift = (int)(ideal <= (uint32_t)empty && ideal > (uint32_t)slot);
+    if (needs_shift) {
+      g_session_hash[empty] = g_session_hash[slot];
+      g_session_hash[slot].occupied = 0;
+      empty = slot;
+    }
+  }
+}
+
+static int session_alloc(uint32_t ip, uint16_t port) {
+  if (g_free_session_count == 0)
     return -1;
+  uint32_t idx = g_free_sessions[--g_free_session_count];
+  session_t *s = &g_sessions[idx];
+  s->session_id = idx;
+  s->ip = ip;
+  s->port = port;
+  s->state = SESSION_WAIT_KEM_ENC;
+  s->rx_seq = 0;
+  s->tx_seq = 1;
+  s->tx_nonce_ctr = 0;
+  s->current_job_id = 0;
+  s->last_seen_ns = now_ns();
+  s->established_time_ns = 0;
+  s->client_registry_id = -1;
+  memset(&s->metrics, 0, sizeof(metrics_t));
+  s->metrics.msg_min_rtt_ms = 1e15;
+
+  session_hash_insert(ip, port, idx);
+  return (int)idx;
 }
 
-static void dispatch_free(int idx)
-{
-    pthread_mutex_lock(&g_pipes_mu);
-    if (g_pipes[idx].used) {
-        close(g_pipes[idx].read_fd);
-        close(g_pipes[idx].write_fd);
-        g_pipes[idx].used = 0;
-    }
-    pthread_mutex_unlock(&g_pipes_mu);
+static void session_free(int idx) {
+  session_t *s = &g_sessions[idx];
+  if (s->state == SESSION_FREE)
+    return;
+
+  session_hash_remove(s->ip, s->port);
+  if (s->client_registry_id > 0) {
+    registry_remove(s->client_registry_id);
+  }
+
+  /* Zeroize sensitive session data */
+  explicit_bzero(s->session_key, sizeof(s->session_key));
+  explicit_bzero(s->sig, sizeof(s->sig));
+  explicit_bzero(s->auth_ctx, SESSION_ID_BYTES);
+  explicit_bzero(s->auth_ctx + SESSION_ID_BYTES + DSA_PK_BYTES, KEM_SS_BYTES);
+
+  s->state = SESSION_FREE;
+  s->generation++;
+  g_free_sessions[g_free_session_count++] = (uint32_t)idx;
 }
 
-/* Write a raw datagram into a pipe (length-prefixed). */
-static void dispatch_write(int write_fd, const uint8_t *pkt, uint16_t len)
-{
-    uint8_t lenbuf[2];
-    lenbuf[0] = (uint8_t)(len >> 8);
-    lenbuf[1] = (uint8_t)(len & 0xFF);
-    /*
-     * Best-effort: drop silently if the pipe is full.
-     * The client's retransmit timer will resend and the next attempt
-     * will succeed once the reader drains the pipe.
-     * We read the return values to satisfy -Wunused-result.
-     */
-    ssize_t w1 = write(write_fd, lenbuf, 2);
-    ssize_t w2 = write(write_fd, pkt,    len);
-    if (w1 != 2 || w2 != (ssize_t)len)
-        fprintf(stderr, "[dispatch] pipe write short — packet dropped\n");
+/* ── Rate Limiter ────────────────────────────────────────────────── */
+typedef struct {
+  uint32_t ip;
+  double tokens;
+  uint64_t last_update_ns;
+} rate_limit_entry_t;
+
+static rate_limit_entry_t g_rate_limit_table[RATE_LIMIT_HASH_SIZE];
+
+static int rate_limit_check(uint32_t ip) {
+  uint32_t host_ip = ntohl(ip);
+  if ((host_ip >> 24) == 127) {
+    return 1;
+  }
+  uint32_t h = ip % RATE_LIMIT_HASH_SIZE;
+  rate_limit_entry_t *e = &g_rate_limit_table[h];
+  uint64_t now = now_ns();
+  if (e->ip != ip) {
+    e->ip = ip;
+    e->tokens = 20.0;
+    e->last_update_ns = now;
+    return 1;
+  }
+  double elapsed_sec = (double)(now - e->last_update_ns) / 1e9;
+  e->tokens += elapsed_sec * 50.0; /* 50 packets per second refill rate */
+  if (e->tokens > 20.0)
+    e->tokens = 20.0;
+  e->last_update_ns = now;
+  if (e->tokens >= 1.0) {
+    e->tokens -= 1.0;
+    return 1;
+  }
+  return 0;
 }
 
-/* Read one length-prefixed datagram from a pipe. Returns payload bytes or -1. */
-static ssize_t dispatch_read(int read_fd, uint8_t *out, size_t max,
-                              int timeout_ms)
-{
-    struct pollfd pfd = { .fd = read_fd, .events = POLLIN };
-    if (poll(&pfd, 1, timeout_ms) <= 0) return -1;
+/* ── io_uring Recv Buffers ───────────────────────────────────────── */
+typedef struct {
+  uint8_t buffer[PKT_BUF_MAX];
+  struct sockaddr_in peer_addr;
+  struct iovec iov;
+  struct msghdr msg;
+  int idx;
+} recv_buf_t;
 
-    uint8_t lenbuf[2];
-    if (read(read_fd, lenbuf, 2) != 2) return -1;
-    uint16_t len = ((uint16_t)lenbuf[0] << 8) | lenbuf[1];
-    if (len == 0 || len > max) return -1;
+static recv_buf_t g_recv_bufs[NUM_RECV_BUFFERS];
+static struct io_uring g_ring;
 
-    ssize_t got = 0;
-    while ((size_t)got < len) {
-        ssize_t r = read(read_fd, out + got, len - (uint16_t)got);
-        if (r <= 0) return -1;
-        got += r;
-    }
-    return got;
+static void submit_recv_request(int idx) {
+  struct io_uring_sqe *sqe = io_uring_get_sqe(&g_ring);
+  if (!sqe)
+    return;
+  io_uring_prep_recvmsg(sqe, g_listen_sock, &g_recv_bufs[idx].msg, 0);
+  io_uring_sqe_set_data(sqe, (void *)(intptr_t)idx);
 }
 
-/* ════════════════════════════════════════════════════════════════════
- * Keygen helpers
- * ════════════════════════════════════════════════════════════════════ */
+/* ── Thread-Safe Outbound Send ───────────────────────────────────── */
+static ssize_t server_send_packet(int sock, const struct sockaddr_in *peer,
+                                  uint32_t seq, uint8_t type,
+                                  const uint8_t *payload,
+                                  uint16_t payload_len) {
+  static uint8_t wire[PKT_HDR_BYTES + 8192];
+  pkt_hdr_t hdr;
+  hdr.seq = htonl(seq);
+  hdr.type = type;
+  hdr.len = htons(payload_len);
 
-static void *dsa_keygen_thread(void *arg)
-{
-    (void)arg;
-    double t0 = now_ms();
-    if (dsa_keypair(g_srv_dsa_pk, g_srv_dsa_sk) != 0) {
-        fprintf(stderr, "[server] DSA keygen failed\n"); exit(1);
-    }
-    g_dsa_keygen_ms = now_ms() - t0;
-    return NULL;
+  pthread_mutex_lock(&g_sock_send_mu);
+  memcpy(wire, &hdr, PKT_HDR_BYTES);
+  if (payload_len > 0) {
+    memcpy(wire + PKT_HDR_BYTES, payload, payload_len);
+  }
+  ssize_t n = sendto(sock, wire, PKT_HDR_BYTES + payload_len, 0,
+                     (const struct sockaddr *)peer, sizeof(*peer));
+  pthread_mutex_unlock(&g_sock_send_mu);
+  return n;
 }
 
-static void *kem_keygen_thread(void *arg)
-{
-    (void)arg;
-    uint8_t pk[KEM_PK_BYTES], sk[KEM_SK_BYTES];
-    double t0 = now_ms();
-    if (kem_keypair(pk, sk) != 0) {
-        fprintf(stderr, "[server] KEM keygen failed\n"); exit(1);
-    }
-    double ms = now_ms() - t0;
+static ssize_t server_send_packet_zero_copy(int sock,
+                                            const struct sockaddr_in *peer,
+                                            uint32_t seq, uint8_t type,
+                                            const struct iovec *iovs,
+                                            int iov_cnt) {
+  pkt_hdr_t hdr;
+  hdr.seq = htonl(seq);
+  hdr.type = type;
 
-    pthread_mutex_lock(&g_kem_mutex);
-    memcpy(g_srv_kem_pk, pk, KEM_PK_BYTES);
-    memcpy(g_srv_kem_sk, sk, KEM_SK_BYTES);
-    g_kem_keygen_ms   = ms;
-    g_kem_cache_valid = 1;
-    pthread_cond_signal(&g_kem_ready);
-    pthread_mutex_unlock(&g_kem_mutex);
-    explicit_bzero(sk, sizeof(sk));
-    return NULL;
+  uint16_t payload_len = 0;
+  for (int i = 0; i < iov_cnt; i++) {
+    payload_len += iovs[i].iov_len;
+  }
+  hdr.len = htons(payload_len);
+
+  struct iovec msg_iov[iov_cnt + 1];
+  msg_iov[0].iov_base = &hdr;
+  msg_iov[0].iov_len = PKT_HDR_BYTES;
+  for (int i = 0; i < iov_cnt; i++) {
+    msg_iov[i + 1] = iovs[i];
+  }
+
+  struct msghdr msg = {0};
+  msg.msg_name = (void *)peer;
+  msg.msg_namelen = sizeof(*peer);
+  msg.msg_iov = msg_iov;
+  msg.msg_iovlen = iov_cnt + 1;
+
+  pthread_mutex_lock(&g_sock_send_mu);
+  ssize_t n = sendmsg(sock, &msg, 0);
+  pthread_mutex_unlock(&g_sock_send_mu);
+  return n;
 }
 
-static void kem_cache_consume(uint8_t pk[KEM_PK_BYTES], uint8_t sk[KEM_SK_BYTES],
-                               double *ms_out)
-{
-    pthread_mutex_lock(&g_kem_mutex);
-    while (!g_kem_cache_valid)
-        pthread_cond_wait(&g_kem_ready, &g_kem_mutex);
-    memcpy(pk, g_srv_kem_pk, KEM_PK_BYTES);
-    memcpy(sk, g_srv_kem_sk, KEM_SK_BYTES);
-    *ms_out           = g_kem_keygen_ms;
-    g_kem_cache_valid = 0;
-    pthread_mutex_unlock(&g_kem_mutex);
+static void server_send_ack(int sock, const struct sockaddr_in *peer,
+                            uint32_t ack_seq) {
+  uint8_t pl[4];
+  pl[0] = (ack_seq >> 24) & 0xFF;
+  pl[1] = (ack_seq >> 16) & 0xFF;
+  pl[2] = (ack_seq >> 8) & 0xFF;
+  pl[3] = ack_seq & 0xFF;
+  server_send_packet(sock, peer, 0, PKT_ACK, pl, 4);
 }
 
-static void kem_cache_refresh_async(void)
-{
-    pthread_t tid;
-    pthread_attr_t a;
-    pthread_attr_init(&a);
-    pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
-    pthread_create(&tid, &a, kem_keygen_thread, NULL);
-    pthread_attr_destroy(&a);
-}
-
-/* ════════════════════════════════════════════════════════════════════
- * Shared-socket send (thread-safe sendto wrapper)
- * ════════════════════════════════════════════════════════════════════ */
-
-static ssize_t shared_sendto(const void *buf, size_t len,
-                              const struct sockaddr_in *peer)
-{
-    pthread_mutex_lock(&g_sock_send_mu);
-    ssize_t n = sendto(g_listen_sock, buf, len, 0,
-                       (const struct sockaddr *)peer, sizeof(*peer));
-    pthread_mutex_unlock(&g_sock_send_mu);
-    return n;
-}
-
-/* ════════════════════════════════════════════════════════════════════
- * Pipe-backed conn_t helpers
- *
- * The session and RX threads use a conn_t whose "socket" is actually
- * the read end of their dispatch pipe.  We override pkt_send to use
- * shared_sendto and pkt_recv to read from the pipe.
- * ════════════════════════════════════════════════════════════════════ */
-
-/*
- * pkt_send_to_peer: send a header+payload directly to a known peer via
- * the shared socket.  Used during handshake and data TX.
- */
-static ssize_t pkt_send_to_peer(conn_t *c, uint8_t type,
-                                 const uint8_t *payload, uint16_t payload_len)
-{
-    uint8_t wire[PKT_HDR_BYTES + PIPE_PKT_MAX];
-    pkt_hdr_t hdr;
-    hdr.seq  = htonl(c->tx_seq++);
-    hdr.type = type;
-    hdr.len  = htons(payload_len);
-    memcpy(wire, &hdr, PKT_HDR_BYTES);
-    if (payload_len > 0)
-        memcpy(wire + PKT_HDR_BYTES, payload, payload_len);
-    return shared_sendto(wire, PKT_HDR_BYTES + payload_len, &c->peer);
-}
-
-/*
- * send_ack_to_peer: send ACK for ack_seq to the peer via shared socket.
- */
-static void send_ack_to_peer(conn_t *c, uint32_t ack_seq)
-{
-    uint8_t pl[4];
-    pl[0] = (ack_seq >> 24) & 0xFF;
-    pl[1] = (ack_seq >> 16) & 0xFF;
-    pl[2] = (ack_seq >>  8) & 0xFF;
-    pl[3] =  ack_seq        & 0xFF;
-    pkt_send_to_peer(c, PKT_ACK, pl, 4);
-}
-
-/*
- * pkt_recv_from_pipe: read one dispatched datagram from the pipe, parse header.
- * timeout_ms: -1 = block forever, 0 = nonblocking, >0 = timeout ms.
- */
-static ssize_t pkt_recv_from_pipe(int pipe_fd, pkt_hdr_t *hdr,
-                                   uint8_t *payload_out, size_t payload_max,
-                                   int timeout_ms)
-{
-    uint8_t raw[PKT_HDR_BYTES + PIPE_PKT_MAX];
-    ssize_t n = dispatch_read(pipe_fd, raw, sizeof(raw), timeout_ms);
-    if (n < (ssize_t)PKT_HDR_BYTES) return -1;
-
-    memcpy(hdr, raw, PKT_HDR_BYTES);
-    hdr->seq = ntohl(hdr->seq);
-    hdr->len = ntohs(hdr->len);
-
-    ssize_t payload_len = n - PKT_HDR_BYTES;
-    if (payload_len < 0) payload_len = 0;
-    if ((size_t)payload_len > payload_max) payload_len = (ssize_t)payload_max;
-    if (payload_len > 0 && payload_out)
-        memcpy(payload_out, raw + PKT_HDR_BYTES, (size_t)payload_len);
-    return payload_len;
-}
-
-/*
- * recv_type_pipe: wait for a specific packet type from the pipe.
- * Sends ACK for matching packet. Drops non-matching non-ACK packets.
- */
-static ssize_t recv_type_pipe(conn_t *c, int pipe_fd, uint8_t want,
-                               uint8_t *buf, size_t max)
-{
-    pkt_hdr_t hdr;
-    for (;;) {
-        ssize_t n = pkt_recv_from_pipe(pipe_fd, &hdr, buf, max, -1);
-        if (n < 0) return -1;
-        if (hdr.type == want) {
-            send_ack_to_peer(c, hdr.seq);
-            return n;
-        }
-        /* Drop unexpected packets (they may be retransmits of earlier phases) */
-    }
-}
-
-/*
- * pkt_send_reliable_to_peer: send with ACK, reading ACKs from pipe.
- */
-static int pkt_send_reliable_pipe(conn_t *c, int pipe_fd, uint8_t type,
-                                   const uint8_t *payload, uint16_t payload_len)
-{
-    uint32_t our_seq = c->tx_seq;
-
-    for (int attempt = 0; attempt < RETX_MAX; attempt++) {
-        if (attempt > 0) c->tx_seq = our_seq;
-
-        pkt_send_to_peer(c, type, payload, payload_len);
-
-        pkt_hdr_t hdr;
-        uint8_t   ack_buf[64];
-        int timeout_ms = ACK_TIMEOUT_US / 1000;
-
-        ssize_t n = pkt_recv_from_pipe(pipe_fd, &hdr, ack_buf,
-                                        sizeof(ack_buf), timeout_ms);
-        if (n >= 4 && hdr.type == PKT_ACK) {
-            uint32_t acked = ((uint32_t)ack_buf[0] << 24)
-                           | ((uint32_t)ack_buf[1] << 16)
-                           | ((uint32_t)ack_buf[2] <<  8)
-                           |  (uint32_t)ack_buf[3];
-            if (acked == our_seq) return 0;
-        }
-    }
-    return -1;
-}
-
-/* ════════════════════════════════════════════════════════════════════
- * IPC helpers
- * ════════════════════════════════════════════════════════════════════ */
-
+/* ── IPC helper wrappers ─────────────────────────────────────────── */
 static void ipc_push_rx_msg(int cid, const char *ip, uint16_t port,
-                             uint64_t sid,
-                             const uint8_t *msg, uint32_t msg_len)
-{
-    pthread_mutex_lock(&g_ipc_rx_mu);
-    if (g_ipc_rx_fd < 0) { pthread_mutex_unlock(&g_ipc_rx_mu); return; }
-
-    uint8_t buf[sizeof(ipc_rx_payload_t) + DATA_CHUNK_MAX];
-    ipc_rx_payload_t *p = (ipc_rx_payload_t *)buf;
-    p->client_id  = (uint16_t)cid;
-    strncpy(p->ip_str, ip, sizeof(p->ip_str) - 1);
-    p->ip_str[sizeof(p->ip_str)-1] = '\0';
-    p->port        = port;
-    p->session_id  = sid;
-    p->msg_len     = msg_len;
-    if (msg_len <= DATA_CHUNK_MAX)
-        memcpy(buf + sizeof(ipc_rx_payload_t), msg, msg_len);
-
-    ipc_send_frame(g_ipc_rx_fd, IPC_MSG_RX, (uint16_t)cid,
-                   buf, (uint32_t)(sizeof(ipc_rx_payload_t) + msg_len));
+                            uint64_t sid, const uint8_t *msg,
+                            uint32_t msg_len) {
+  pthread_mutex_lock(&g_ipc_rx_mu);
+  if (g_ipc_rx_fd < 0) {
     pthread_mutex_unlock(&g_ipc_rx_mu);
+    return;
+  }
+
+  uint8_t buf[sizeof(ipc_rx_payload_t) + DATA_CHUNK_MAX];
+  ipc_rx_payload_t *p = (ipc_rx_payload_t *)buf;
+  p->client_id = (uint16_t)cid;
+  strncpy(p->ip_str, ip, sizeof(p->ip_str) - 1);
+  p->ip_str[sizeof(p->ip_str) - 1] = '\0';
+  p->port = port;
+  p->session_id = sid;
+  p->msg_len = msg_len;
+  if (msg_len <= DATA_CHUNK_MAX)
+    memcpy(buf + sizeof(ipc_rx_payload_t), msg, msg_len);
+
+  ipc_send_frame(g_ipc_rx_fd, IPC_MSG_RX, (uint16_t)cid, buf,
+                 (uint32_t)(sizeof(ipc_rx_payload_t) + msg_len));
+  pthread_mutex_unlock(&g_ipc_rx_mu);
 }
 
 static void ipc_push_rx_metrics(int cid, float dec_us, float ia_ms,
-                                 float jitter, float avg_dec,
-                                 uint64_t bytes_recv, uint32_t seq)
-{
-    pthread_mutex_lock(&g_ipc_rx_mu);
-    if (g_ipc_rx_fd < 0) { pthread_mutex_unlock(&g_ipc_rx_mu); return; }
-
-    ipc_metrics_rx_t m = {0};
-    m.client_id       = (uint16_t)cid;
-    m.decrypt_us      = dec_us;
-    m.interarrival_ms = ia_ms;
-    m.jitter_ms       = jitter;
-    m.avg_decrypt_us  = avg_dec;
-    m.bytes_recv      = bytes_recv;
-    m.pkt_seq         = seq;
-    ipc_send_frame(g_ipc_rx_fd, IPC_METRICS_RX, (uint16_t)cid,
-                   &m, sizeof(m));
+                                float jitter, float avg_dec,
+                                uint64_t bytes_recv, uint32_t seq) {
+  pthread_mutex_lock(&g_ipc_rx_mu);
+  if (g_ipc_rx_fd < 0) {
     pthread_mutex_unlock(&g_ipc_rx_mu);
+    return;
+  }
+
+  ipc_metrics_rx_t m = {0};
+  m.client_id = (uint16_t)cid;
+  m.decrypt_us = dec_us;
+  m.interarrival_ms = ia_ms;
+  m.jitter_ms = jitter;
+  m.avg_decrypt_us = avg_dec;
+  m.bytes_recv = bytes_recv;
+  m.pkt_seq = seq;
+  ipc_send_frame(g_ipc_rx_fd, IPC_METRICS_RX, (uint16_t)cid, &m, sizeof(m));
+  pthread_mutex_unlock(&g_ipc_rx_mu);
 }
 
-static void ipc_push_client_list(void)
-{
-    pthread_mutex_lock(&g_ipc_tx_mu);
-    if (g_ipc_tx_fd < 0) { pthread_mutex_unlock(&g_ipc_tx_mu); return; }
-
-    client_info_t infos[MAX_CLIENTS];
-    int cnt = registry_get_snapshot(infos, MAX_CLIENTS);
-
-    size_t sz = sizeof(uint16_t) + (size_t)cnt * sizeof(ipc_client_entry_t);
-    uint8_t *buf = malloc(sz);
-    if (!buf) { pthread_mutex_unlock(&g_ipc_tx_mu); return; }
-
-    uint16_t c16 = (uint16_t)cnt;
-    memcpy(buf, &c16, sizeof(c16));
-    ipc_client_entry_t *e = (ipc_client_entry_t *)(buf + sizeof(uint16_t));
-    for (int i = 0; i < cnt; i++) {
-        e[i].client_id     = (uint16_t)infos[i].client_id;
-        memcpy(e[i].ip_str, infos[i].ip_str, sizeof(e[i].ip_str));
-        e[i].port          = infos[i].port;
-        e[i].session_id    = infos[i].session_id;
-        e[i].hs_total_ms   = (float)infos[i].hs_total_ms;
-        e[i].msg_count     = (uint32_t)infos[i].msg_count;
-        e[i].bytes_sent_kb = (uint32_t)(infos[i].bytes_sent / 1024);
-        e[i].bytes_recv_kb = (uint32_t)(infos[i].bytes_recv / 1024);
-    }
-
-    ipc_send_frame(g_ipc_tx_fd, IPC_CLIENT_LIST, 0, buf, (uint32_t)sz);
-    free(buf);
+static void ipc_push_client_list(void) {
+  pthread_mutex_lock(&g_ipc_tx_mu);
+  if (g_ipc_tx_fd < 0) {
     pthread_mutex_unlock(&g_ipc_tx_mu);
+    return;
+  }
+
+  client_info_t infos[MAX_CLIENTS];
+  int cnt = registry_get_snapshot(infos, MAX_CLIENTS);
+
+  size_t sz = sizeof(uint16_t) + (size_t)cnt * sizeof(ipc_client_entry_t);
+  uint8_t *buf = malloc(sz);
+  if (!buf) {
+    pthread_mutex_unlock(&g_ipc_tx_mu);
+    return;
+  }
+
+  uint16_t c16 = (uint16_t)cnt;
+  memcpy(buf, &c16, sizeof(c16));
+  ipc_client_entry_t *e = (ipc_client_entry_t *)(buf + sizeof(uint16_t));
+  for (int i = 0; i < cnt; i++) {
+    e[i].client_id = (uint16_t)infos[i].client_id;
+    memcpy(e[i].ip_str, infos[i].ip_str, sizeof(e[i].ip_str));
+    e[i].port = infos[i].port;
+    e[i].session_id = infos[i].session_id;
+    e[i].hs_total_ms = (float)infos[i].hs_total_ms;
+    e[i].msg_count = (uint32_t)infos[i].msg_count;
+    e[i].bytes_sent_kb = (uint32_t)(infos[i].bytes_sent / 1024);
+    e[i].bytes_recv_kb = (uint32_t)(infos[i].bytes_recv / 1024);
+  }
+  ipc_send_frame(g_ipc_tx_fd, IPC_CLIENT_LIST, 0, buf, (uint32_t)sz);
+  free(buf);
+  pthread_mutex_unlock(&g_ipc_tx_mu);
 }
 
-/* ════════════════════════════════════════════════════════════════════
- * Per-client RX thread
- * ════════════════════════════════════════════════════════════════════ */
+/* ── Crypto Worker Threads ───────────────────────────────────────── */
+static void *crypto_worker_thread(void *arg) {
+  int core_id = (int)(intptr_t)arg;
+  cpu_set_t cpuset;
+  CPU_ZERO(&cpuset);
+  CPU_SET(core_id, &cpuset);
+  pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
 
-typedef struct {
-    int      client_id;
-    int      pipe_fd;     /* read end of dispatch pipe */
-    volatile int stop;
-} client_rx_args_t;
+  int idle_spin = 0;
+  while (!g_stop) {
+    crypto_job_t job;
+    if (pop_job(&job) == 0) {
+      idle_spin = 0;
 
-static void *client_rx_thread(void *arg)
-{
-    client_rx_args_t *a = (client_rx_args_t *)arg;
-    int cid     = a->client_id;
-    int pipe_fd = a->pipe_fd;
+      /* Consume the semaphore token so the semaphore value matches queue state
+       */
+      sem_trywait(&g_job_sem);
 
-    conn_t    *c = registry_get_conn(cid);
-    metrics_t *m = registry_get_metrics(cid);
-    if (!c || !m) { free(a); return NULL; }
+      crypto_completion_t comp;
+      comp.job_id = job.job_id;
+      comp.session_id = job.session_id;
+      comp.generation = job.generation;
+      comp.type = job.type;
+      comp.status = -1;
 
-    char     ip_str[INET_ADDRSTRLEN] = "?";
-    uint16_t port = 0;
-    uint64_t sid  = c->session_id;
-    {
-        client_info_t all[MAX_CLIENTS];
-        int cnt = registry_get_snapshot(all, MAX_CLIENTS);
-        for (int i = 0; i < cnt; i++) {
-            if (all[i].client_id == cid) {
-                strncpy(ip_str, all[i].ip_str, sizeof(ip_str)-1);
-                port = all[i].port;
-                break;
-            }
-        }
+      if (job.type == PKT_CLIENT_HELLO) {
+        comp.status = kem_enc(job.kem_ct, job.session_key, job.client_kem_pk);
+      } else if (job.type == PKT_CLIENT_AUTH) {
+        comp.status = dsa_verify(job.sig, job.sig_len, job.auth_ctx,
+                                 AUTH_CTX_LEN, job.client_dsa_pk);
+      }
+
+      while (push_completion(&comp) != 0) {
+        __builtin_ia32_pause();
+      }
+    } else {
+      if (++idle_spin > 1000) {
+        /* Spin threshold exceeded, sleep to save CPU resources */
+        sem_wait(&g_job_sem);
+        idle_spin = 0;
+      } else {
+        __builtin_ia32_pause();
+      }
     }
+  }
+  return NULL;
+}
 
-    char ts[16];
-    now_hms(ts, sizeof(ts));
-    printf("[%s] RX thread live: CLIENT-%02d (%s:%u)\n",
-           ts, cid, ip_str, port);
-
-    uint8_t pt[DATA_CHUNK_MAX + 16];
-
-    while (!a->stop && !g_stop) {
-        pkt_hdr_t hdr;
-        uint8_t raw[12 + 16 + DATA_CHUNK_MAX + 64];
-
-        ssize_t n = pkt_recv_from_pipe(pipe_fd, &hdr, raw, sizeof(raw),
-                                        RX_POLL_TIMEOUT_US / 1000);
-        if (n < 0) continue;
-        if (hdr.type != PKT_DATA) continue;
-        if (n < 28) continue;
-
-        uint64_t recv_ns = now_ns();
-
-        const uint8_t *nonce = raw;
-        const uint8_t *tag   = raw + 12;
-        const uint8_t *ct    = raw + 28;
-        int ct_len = (int)n - 28;
-        if (ct_len <= 0) continue;
-
-        double dec_t0 = now_ms();
-        int pt_len = aead_decrypt(ct, ct_len, c->session_key, nonce, tag, pt);
-        double dec_us = (now_ms() - dec_t0) * 1000.0;
-
-        if (pt_len <= 0) {
-            fprintf(stderr, "[CLIENT-%02d] AEAD auth failure\n", cid);
-            continue;
-        }
-
-        if (pt_len < (int)sizeof(pt)) pt[pt_len] = '\0';
-        while (pt_len > 0 &&
-               (pt[pt_len-1] == '\n' || pt[pt_len-1] == '\r'))
-            pt[--pt_len] = '\0';
-
-        m->bytes_recv       += (uint64_t)(PKT_HDR_BYTES + n);
-        m->total_decrypt_us += dec_us;
-        m->decrypt_count++;
-        metrics_update_rtt(m, recv_ns);
-        registry_mark_recv(cid, recv_ns);
-
-        float avg_dec = (m->decrypt_count > 0)
-            ? (float)(m->total_decrypt_us / (double)m->decrypt_count) : 0.f;
-
-        ipc_push_rx_msg(cid, ip_str, port, sid, pt, (uint32_t)pt_len);
-        ipc_push_rx_metrics(cid, (float)dec_us,
-                            (float)m->msg_last_rtt_ms,
-                            (float)m->jitter_ms,
-                            avg_dec, m->bytes_recv,
-                            (uint32_t)m->decrypt_count);
-
-        now_hms(ts, sizeof(ts));
-        printf("[%s] \033[1;36m[CLIENT-%02d %s:%u]\033[0m %s\n",
-               ts, cid, ip_str, port, (char *)pt);
-        fflush(stdout);
+/* ── IPC acceptor threads (Warm Path) ────────────────────────────── */
+static void *ipc_rx_accept_thread(void *arg) {
+  int lfd = *(int *)arg;
+  free(arg);
+  while (!g_stop) {
+    int fd = accept(lfd, NULL, NULL);
+    if (fd < 0) {
+      if (g_stop)
+        break;
+      usleep(100000);
+      continue;
     }
+    printf("[server] server_rx connected\n");
+    pthread_mutex_lock(&g_ipc_rx_mu);
+    if (g_ipc_rx_fd >= 0)
+      close(g_ipc_rx_fd);
+    g_ipc_rx_fd = fd;
+    pthread_mutex_unlock(&g_ipc_rx_mu);
+  }
+  close(lfd);
+  return NULL;
+}
 
-    now_hms(ts, sizeof(ts));
-    printf("[%s] CLIENT-%02d session ended (%s:%u)\n",
-           ts, cid, ip_str, port);
-    metrics_print(m);
+static void *ipc_tx_rx_loop(void *arg) {
+  int fd = (int)(intptr_t)arg;
+  uint8_t buf[sizeof(ipc_tx_cmd_t) + DATA_CHUNK_MAX + 64];
+  char ts[16];
 
-    registry_remove(cid);
-    ipc_push_client_list();
+  while (!g_stop) {
+    ipc_hdr_t hdr;
+    ssize_t n = ipc_recv_frame(fd, &hdr, buf, sizeof(buf));
+    if (n < 0)
+      break;
 
+    if (hdr.type == IPC_MSG_TX_CMD) {
+      if (n < (ssize_t)sizeof(ipc_tx_cmd_t))
+        continue;
+      ipc_tx_cmd_t *cmd = (ipc_tx_cmd_t *)buf;
+      uint32_t msg_len = cmd->msg_len;
+      uint16_t target = cmd->client_id;
+      const uint8_t *msg = buf + sizeof(ipc_tx_cmd_t);
+      if (msg_len == 0 || msg_len > DATA_CHUNK_MAX)
+        continue;
+
+      now_hms(ts, sizeof(ts));
+      if (target == 0) {
+        int ok = registry_broadcast(msg, msg_len);
+        printf("[%s] BROADCAST → %d client(s): %.*s\n", ts, ok, (int)msg_len,
+               msg);
+      } else {
+        if (registry_send((int)target, msg, msg_len) == 0) {
+          printf("[%s] TX → CLIENT-%02d: %.*s\n", ts, target, (int)msg_len,
+                 msg);
+
+          metrics_t *m = registry_get_metrics((int)target);
+          if (m) {
+            ipc_metrics_tx_t mt = {0};
+            mt.client_id = target;
+            mt.encrypt_us =
+                (m->encrypt_count > 0)
+                    ? (float)(m->total_encrypt_us / (double)m->encrypt_count)
+                    : 0.f;
+            mt.avg_encrypt_us = mt.encrypt_us;
+            mt.bytes_sent = m->bytes_sent;
+            mt.msg_count = (uint32_t)m->msg_count;
+            mt.retransmissions = (uint32_t)m->retransmissions;
+            pthread_mutex_lock(&g_ipc_tx_mu);
+            ipc_send_frame(fd, IPC_METRICS_TX, target, &mt, sizeof(mt));
+            pthread_mutex_unlock(&g_ipc_tx_mu);
+          }
+        } else {
+          fprintf(stderr, "[server] TX to CLIENT-%02d failed\n", target);
+        }
+      }
+      ipc_push_client_list();
+    }
+  }
+  pthread_mutex_lock(&g_ipc_tx_mu);
+  if (g_ipc_tx_fd == fd)
+    g_ipc_tx_fd = -1;
+  pthread_mutex_unlock(&g_ipc_tx_mu);
+  close(fd);
+  printf("[server] server_tx disconnected\n");
+  return NULL;
+}
+
+static void *ipc_tx_accept_thread(void *arg) {
+  int lfd = *(int *)arg;
+  free(arg);
+  while (!g_stop) {
+    int fd = accept(lfd, NULL, NULL);
+    if (fd < 0) {
+      if (g_stop)
+        break;
+      usleep(100000);
+      continue;
+    }
+    printf("[server] server_tx connected\n");
     pthread_mutex_lock(&g_ipc_tx_mu);
     if (g_ipc_tx_fd >= 0)
-        ipc_send_frame(g_ipc_tx_fd, IPC_CLIENT_DISCONNECT,
-                       (uint16_t)cid, NULL, 0);
+      close(g_ipc_tx_fd);
+    g_ipc_tx_fd = fd;
     pthread_mutex_unlock(&g_ipc_tx_mu);
 
-    free(a);
-    return NULL;
+    pthread_t tid;
+    pthread_create(&tid, NULL, ipc_tx_rx_loop, (void *)(intptr_t)fd);
+    pthread_detach(tid);
+  }
+  close(lfd);
+  return NULL;
 }
 
-/* ════════════════════════════════════════════════════════════════════
- * Session thread — PQC handshake
- * ════════════════════════════════════════════════════════════════════ */
+static int make_ipc_server(const char *path) {
+  unlink(path);
+  int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (fd < 0) {
+    perror("socket(ipc)");
+    return -1;
+  }
+  struct sockaddr_un a = {0};
+  a.sun_family = AF_UNIX;
+  strncpy(a.sun_path, path, sizeof(a.sun_path) - 1);
+  if (bind(fd, (struct sockaddr *)&a, sizeof(a)) < 0) {
+    perror("bind(ipc)");
+    close(fd);
+    return -1;
+  }
+  if (listen(fd, 4) < 0) {
+    perror("listen(ipc)");
+    close(fd);
+    return -1;
+  }
+  return fd;
+}
 
-typedef struct {
-    struct sockaddr_in peer;
-    int                pipe_idx;   /* index into g_pipes[] */
-} session_args_t;
+/* ── Main Loop and State Processing ──────────────────────────────── */
+static void process_completion(const crypto_completion_t *comp) {
+  uint32_t s_idx = comp->session_id;
+  if (s_idx >= MAX_SESSIONS)
+    return;
 
-static void *session_thread(void *arg)
-{
-    session_args_t *sa   = (session_args_t *)arg;
-    struct sockaddr_in peer = sa->peer;
-    int    pipe_idx      = sa->pipe_idx;
-    free(sa);
+  session_t *s = &g_sessions[s_idx];
+  if (s->state == SESSION_FREE || s->generation != comp->generation ||
+      s->current_job_id != comp->job_id) {
+    return; /* Ignore stale job completions */
+  }
 
-    int pipe_fd = g_pipes[pipe_idx].read_fd;
+  struct sockaddr_in peer;
+  peer.sin_family = AF_INET;
+  peer.sin_port = s->port;
+  peer.sin_addr.s_addr = s->ip;
 
-    /* Build a conn_t pointing at this peer.
-     * sock field is not used for recv (we use the pipe) but is needed
-     * for the tx_seq counter and peer address. */
+  if (comp->type == PKT_CLIENT_HELLO) {
+    if (s->state != SESSION_WAIT_KEM_ENC)
+      return;
+
+    if (comp->status != 0) {
+      session_free(s_idx);
+      return;
+    }
+
+    /* Derive key using KDF (SHAKE-256) */
+    uint8_t derived_key[DERIVED_KEY_BYTES];
+    kem_derive_key(derived_key, s->session_key);
+    memcpy(s->session_key, derived_key, KEM_SS_BYTES);
+
+    uint8_t sid[SESSION_ID_BYTES];
+    if (RAND_bytes(sid, SESSION_ID_BYTES) != 1) {
+      session_free(s_idx);
+      return;
+    }
+    uint64_t sid64 = 0;
+    for (int i = 0; i < SESSION_ID_BYTES; i++) {
+      sid64 = (sid64 << 8) | sid[i];
+    }
+    s->session_id_val = sid64;
+
+    /* SERVER_HELLO layout (3 elements, server_kem_pk removed to save 1184
+     * bytes): srv_dsa_pk || kem_ct || session_id */
+    struct iovec iovs[3];
+    iovs[0].iov_base = g_srv_dsa_pk;
+    iovs[0].iov_len = DSA_PK_BYTES;
+    iovs[1].iov_base = s->kem_ct;
+    iovs[1].iov_len = KEM_CT_BYTES;
+    iovs[2].iov_base = sid;
+    iovs[2].iov_len = SESSION_ID_BYTES;
+
+    s->state = SESSION_WAIT_AUTH;
+    s->last_seen_ns = now_ns();
+
+    server_send_packet_zero_copy(g_listen_sock, &peer, s->tx_seq,
+                                 PKT_SERVER_HELLO, iovs, 3);
+  } else if (comp->type == PKT_CLIENT_AUTH) {
+    if (s->state != SESSION_WAIT_AUTH_VER)
+      return;
+
+    if (comp->status != 0) {
+      session_free(s_idx);
+      return;
+    }
+
     conn_t c = {0};
-    c.sock     = g_listen_sock;   /* only used indirectly via pkt_send_to_peer */
-    c.peer     = peer;
+    c.sock = g_listen_sock;
+    c.peer = peer;
     c.peer_len = sizeof(peer);
-    c.tx_seq   = 1;
-
-    char ip_str[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &peer.sin_addr, ip_str, sizeof(ip_str));
-    uint16_t peer_port = ntohs(peer.sin_port);
-
-    /* Consume pre-cached KEM keypair */
-    uint8_t srv_kem_pk[KEM_PK_BYTES];
-    uint8_t srv_kem_sk[KEM_SK_BYTES];
-    double  kem_ms = 0.0;
-    kem_cache_consume(srv_kem_pk, srv_kem_sk, &kem_ms);
-    kem_cache_refresh_async();
-
-    metrics_t metrics = {0};
-    metrics.msg_min_rtt_ms   = 1e15;
-    metrics.hs_kem_keygen_ms = kem_ms;
-    metrics.hs_dsa_keygen_ms = g_dsa_keygen_ms;
-
-    char ts[16]; now_hms(ts, sizeof(ts));
-    printf("[%s] Handshake: %s:%u\n", ts, ip_str, peer_port);
-
-    /* ── Phase 1: CLIENT_HELLO ─────────────────────────────────── */
-    uint8_t cli_kem_pk[KEM_PK_BYTES], cli_dsa_pk[DSA_PK_BYTES];
-    {
-        uint8_t buf[KEM_PK_BYTES + DSA_PK_BYTES + 32];
-        ssize_t n = recv_type_pipe(&c, pipe_fd, PKT_CLIENT_HELLO,
-                                   buf, sizeof(buf));
-        if (n < (ssize_t)(KEM_PK_BYTES + DSA_PK_BYTES)) {
-            fprintf(stderr, "[server] CLIENT_HELLO too short from %s\n",
-                    ip_str);
-            goto fail;
-        }
-        memcpy(cli_kem_pk, buf,                KEM_PK_BYTES);
-        memcpy(cli_dsa_pk, buf + KEM_PK_BYTES, DSA_PK_BYTES);
-    }
-
-    /* ── Phase 2: KEM encaps → SERVER_HELLO ─────────────────────── */
-    uint8_t kem_ct[KEM_CT_BYTES];
-    uint8_t shared_secret[KEM_SS_BYTES];
-    uint8_t session_id[SESSION_ID_BYTES];
-    {
-        double t0 = now_ms();
-        if (kem_enc(kem_ct, shared_secret, cli_kem_pk) != 0) goto fail;
-        metrics.hs_encap_ms = now_ms() - t0;
-
-        if (RAND_bytes(session_id, SESSION_ID_BYTES) != 1) {
-            uint64_t t = now_ns();
-            memcpy(session_id, &t, SESSION_ID_BYTES);
-        }
-
-        uint8_t sh[KEM_PK_BYTES + DSA_PK_BYTES + KEM_CT_BYTES + SESSION_ID_BYTES];
-        size_t off = 0;
-        memcpy(sh + off, srv_kem_pk,   KEM_PK_BYTES);   off += KEM_PK_BYTES;
-        memcpy(sh + off, g_srv_dsa_pk, DSA_PK_BYTES);   off += DSA_PK_BYTES;
-        memcpy(sh + off, kem_ct,       KEM_CT_BYTES);   off += KEM_CT_BYTES;
-        memcpy(sh + off, session_id,   SESSION_ID_BYTES);
-
-        if (pkt_send_reliable_pipe(&c, pipe_fd, PKT_SERVER_HELLO,
-                                    sh, (uint16_t)sizeof(sh)) != 0) {
-            fprintf(stderr, "[server] SERVER_HELLO unacknowledged by %s\n",
-                    ip_str);
-            goto fail;
-        }
-    }
-
-    /* ── Phase 3: CLIENT_AUTH ────────────────────────────────────── */
-    {
-        uint8_t sig_buf[DSA_SIG_BYTES + 32];
-        ssize_t sig_len = recv_type_pipe(&c, pipe_fd, PKT_CLIENT_AUTH,
-                                          sig_buf, sizeof(sig_buf));
-        if (sig_len <= 0) goto fail;
-
-        uint8_t auth_ctx[AUTH_CTX_LEN];
-        size_t off = 0;
-        memcpy(auth_ctx + off, session_id,    SESSION_ID_BYTES); off += SESSION_ID_BYTES;
-        memcpy(auth_ctx + off, g_srv_dsa_pk,  DSA_PK_BYTES);    off += DSA_PK_BYTES;
-        memcpy(auth_ctx + off, shared_secret, KEM_SS_BYTES);
-
-        double t0 = now_ms();
-        int vrc = dsa_verify(sig_buf, (size_t)sig_len,
-                             auth_ctx, AUTH_CTX_LEN, cli_dsa_pk);
-        metrics.hs_verify_ms = now_ms() - t0;
-        explicit_bzero(auth_ctx, sizeof(auth_ctx));
-
-        if (vrc != 0) {
-            fprintf(stderr, "[server] Signature INVALID from %s\n", ip_str);
-            explicit_bzero(shared_secret, sizeof(shared_secret));
-            goto fail;
-        }
-    }
-
-    /* ── Phase 4: session active ─────────────────────────────────── */
-    memcpy(c.session_key, shared_secret, KEM_SS_BYTES);
+    c.tx_seq = s->tx_seq;
     c.established = 1;
-    explicit_bzero(srv_kem_sk, sizeof(srv_kem_sk));
-    explicit_bzero(shared_secret, sizeof(shared_secret));
+    memcpy(c.session_key, s->session_key, KEM_SS_BYTES);
+    c.session_id = s->session_id_val;
 
-    metrics.hs_total_ms = metrics.hs_encap_ms + metrics.hs_verify_ms;
-    {
-        uint64_t sid64 = 0;
-        for (int i = 0; i < SESSION_ID_BYTES; i++)
-            sid64 = (sid64 << 8) | session_id[i];
-        c.session_id = sid64;
-    }
-    metrics.session_start_ns = now_ns();
-
-    printf("\n  ┌── PQC Handshake [%s:%u] ─────────────────────┐\n",
-           ip_str, peer_port);
-    printf("  │  KEM-keygen : %7.3f ms  DSA-keygen : %7.3f ms  │\n",
-           metrics.hs_kem_keygen_ms, metrics.hs_dsa_keygen_ms);
-    printf("  │  KEM-encaps : %7.3f ms  DSA-verify : %7.3f ms  │\n",
-           metrics.hs_encap_ms, metrics.hs_verify_ms);
-    printf("  │  Total      : %7.3f ms  %s                      │\n",
-           metrics.hs_total_ms,
-           metrics.hs_total_ms <= 1.0 ? "\033[32m✓ <1ms\033[0m"
-                                      : "\033[33m⚠ >1ms\033[0m");
-    printf("  └───────────────────────────────────────────────────┘\n\n");
-
-    /* Register client */
-    int cid = registry_add(&c, &metrics);
+    s->metrics.hs_total_ms = (double)(now_ns() - s->last_seen_ns) / 1e6;
+    int cid = registry_add(&c, &s->metrics);
     if (cid < 0) {
-        fprintf(stderr, "[server] Registry full — dropping %s\n", ip_str);
-        goto fail;
+      session_free(s_idx);
+      return;
     }
 
-    now_hms(ts, sizeof(ts));
-    printf("[%s] \033[1;32m✓ CLIENT-%02d\033[0m  %s:%u  "
-           "SID=%016llx  HS=%.3fms  Active=%d\n\n",
-           ts, cid, ip_str, peer_port,
-           (unsigned long long)c.session_id,
-           metrics.hs_total_ms,
-           registry_count());
+    s->client_registry_id = cid;
+    s->state = SESSION_ESTABLISHED;
+    s->established_time_ns = now_ns();
+    s->last_seen_ns = now_ns();
 
-    /* Notify TX terminal */
     ipc_push_client_list();
     pthread_mutex_lock(&g_ipc_tx_mu);
     if (g_ipc_tx_fd >= 0) {
-        ipc_client_entry_t ce = {0};
-        ce.client_id   = (uint16_t)cid;
-        strncpy(ce.ip_str, ip_str, sizeof(ce.ip_str)-1);
-        ce.port        = peer_port;
-        ce.session_id  = c.session_id;
-        ce.hs_total_ms = (float)metrics.hs_total_ms;
-        ipc_send_frame(g_ipc_tx_fd, IPC_CLIENT_CONNECT,
-                       (uint16_t)cid, &ce, sizeof(ce));
+      ipc_client_entry_t ce = {0};
+      ce.client_id = (uint16_t)cid;
+      char ip_str[16];
+      inet_ntop(AF_INET, &peer.sin_addr, ip_str, sizeof(ip_str));
+      strncpy(ce.ip_str, ip_str, sizeof(ce.ip_str) - 1);
+      ce.port = ntohs(peer.sin_port);
+      ce.session_id = s->session_id_val;
+      ce.hs_total_ms = (float)s->metrics.hs_total_ms;
+      ipc_send_frame(g_ipc_tx_fd, IPC_CLIENT_CONNECT, (uint16_t)cid, &ce,
+                     sizeof(ce));
     }
     pthread_mutex_unlock(&g_ipc_tx_mu);
 
-    /* Spawn RX thread — it owns this pipe slot from here on */
-    {
-        client_rx_args_t *rx = malloc(sizeof(client_rx_args_t));
-        rx->client_id = cid;
-        rx->pipe_fd   = pipe_fd;
-        rx->stop      = 0;
-        pthread_t tid;
-        pthread_attr_t attr;
-        pthread_attr_init(&attr);
-        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-        pthread_create(&tid, &attr, client_rx_thread, rx);
-        pthread_attr_destroy(&attr);
-    }
-    /* NOTE: do NOT call dispatch_free here — rx thread owns the pipe now */
-    return NULL;
-
-fail:
-    explicit_bzero(srv_kem_sk, sizeof(srv_kem_sk));
-    dispatch_free(pipe_idx);
-    return NULL;
+    char ip_str[16];
+    inet_ntop(AF_INET, &peer.sin_addr, ip_str, sizeof(ip_str));
+    char ts[16];
+    now_hms(ts, sizeof(ts));
+    printf("[%s] \033[1;32m✓ CLIENT-%02d\033[0m  %s:%u  SID=%016llx  HS=%.3fms "
+           " Active=%d\n\n",
+           ts, cid, ip_str, ntohs(peer.sin_port),
+           (unsigned long long)s->session_id_val, s->metrics.hs_total_ms,
+           registry_count());
+  }
 }
 
-/* ════════════════════════════════════════════════════════════════════
- * IPC accept threads
- * ════════════════════════════════════════════════════════════════════ */
+static void sweep_timeouts(void) {
+  static uint64_t last_sweep_ns = 0;
+  uint64_t now = now_ns();
+  if (now - last_sweep_ns < 1000000000ULL)
+    return; /* Sweep once a second */
+  last_sweep_ns = now;
 
-static void *ipc_rx_accept_thread(void *arg)
-{
-    int lfd = *(int *)arg; free(arg);
-    while (!g_stop) {
-        struct pollfd pfd = { .fd = lfd, .events = POLLIN };
-        if (poll(&pfd, 1, 500) <= 0) continue;
-        int fd = accept(lfd, NULL, NULL);
-        if (fd < 0) continue;
+  for (int i = 0; i < MAX_SESSIONS; i++) {
+    session_t *s = &g_sessions[i];
+    if (s->state == SESSION_FREE)
+      continue;
 
-        pthread_mutex_lock(&g_ipc_rx_mu);
-        if (g_ipc_rx_fd >= 0) close(g_ipc_rx_fd);
-        g_ipc_rx_fd = fd;
-        pthread_mutex_unlock(&g_ipc_rx_mu);
-        printf("[server] server_rx connected (fd=%d)\n", fd);
+    uint64_t elapsed_ns = now - s->last_seen_ns;
+    if (s->state == SESSION_ESTABLISHED) {
+      if (elapsed_ns > 60000000000ULL) { /* 60 seconds timeout */
+        char ip_str[16];
+        inet_ntop(AF_INET, &s->ip, ip_str, sizeof(ip_str));
+        char ts[16];
+        now_hms(ts, sizeof(ts));
+        printf("[%s] Client timeout: %s:%u\n", ts, ip_str, ntohs(s->port));
 
-        char drain[64];
-        while (!g_stop && recv(fd, drain, sizeof(drain), 0) > 0) {}
-
-        pthread_mutex_lock(&g_ipc_rx_mu);
-        close(g_ipc_rx_fd); g_ipc_rx_fd = -1;
-        pthread_mutex_unlock(&g_ipc_rx_mu);
-        printf("[server] server_rx disconnected\n");
-    }
-    close(lfd);
-    return NULL;
-}
-
-static void *ipc_tx_accept_thread(void *arg)
-{
-    int lfd = *(int *)arg; free(arg);
-    while (!g_stop) {
-        struct pollfd pfd = { .fd = lfd, .events = POLLIN };
-        if (poll(&pfd, 1, 500) <= 0) continue;
-        int fd = accept(lfd, NULL, NULL);
-        if (fd < 0) continue;
-
-        pthread_mutex_lock(&g_ipc_tx_mu);
-        if (g_ipc_tx_fd >= 0) close(g_ipc_tx_fd);
-        g_ipc_tx_fd = fd;
-        pthread_mutex_unlock(&g_ipc_tx_mu);
-        printf("[server] server_tx connected (fd=%d)\n", fd);
+        int cid = s->client_registry_id;
+        session_free(i);
 
         ipc_push_client_list();
-
-        char ts[16];
-        uint8_t buf[sizeof(ipc_tx_cmd_t) + DATA_CHUNK_MAX + 8];
-        while (!g_stop) {
-            ipc_hdr_t hdr;
-            ssize_t n = ipc_recv_frame(fd, &hdr, buf, sizeof(buf));
-            if (n < 0) break;
-            if (hdr.type != IPC_MSG_TX_CMD) continue;
-            if (n < (ssize_t)sizeof(ipc_tx_cmd_t)) continue;
-
-            ipc_tx_cmd_t *cmd  = (ipc_tx_cmd_t *)buf;
-            uint32_t msg_len   = cmd->msg_len;
-            uint16_t target    = cmd->client_id;
-            const uint8_t *msg = buf + sizeof(ipc_tx_cmd_t);
-            if (msg_len == 0 || msg_len > DATA_CHUNK_MAX) continue;
-
-            now_hms(ts, sizeof(ts));
-            if (target == 0) {
-                int ok = registry_broadcast(msg, msg_len);
-                printf("[%s] BROADCAST → %d client(s): %.*s\n",
-                       ts, ok, (int)msg_len, msg);
-            } else {
-                if (registry_send((int)target, msg, msg_len) == 0) {
-                    printf("[%s] TX → CLIENT-%02d: %.*s\n",
-                           ts, target, (int)msg_len, msg);
-
-                    metrics_t *m = registry_get_metrics((int)target);
-                    if (m) {
-                        ipc_metrics_tx_t mt = {0};
-                        mt.client_id       = target;
-                        mt.encrypt_us      = (m->encrypt_count > 0)
-                            ? (float)(m->total_encrypt_us / (double)m->encrypt_count) : 0.f;
-                        mt.avg_encrypt_us  = mt.encrypt_us;
-                        mt.bytes_sent      = m->bytes_sent;
-                        mt.msg_count       = (uint32_t)m->msg_count;
-                        mt.retransmissions = (uint32_t)m->retransmissions;
-                        pthread_mutex_lock(&g_ipc_tx_mu);
-                        ipc_send_frame(fd, IPC_METRICS_TX, target,
-                                       &mt, sizeof(mt));
-                        pthread_mutex_unlock(&g_ipc_tx_mu);
-                    }
-                } else {
-                    fprintf(stderr, "[server] TX to CLIENT-%02d failed\n",
-                            target);
-                }
-            }
-            ipc_push_client_list();
-        }
-
         pthread_mutex_lock(&g_ipc_tx_mu);
-        close(g_ipc_tx_fd); g_ipc_tx_fd = -1;
+        if (g_ipc_tx_fd >= 0) {
+          ipc_send_frame(g_ipc_tx_fd, IPC_CLIENT_DISCONNECT, (uint16_t)cid,
+                         NULL, 0);
+        }
         pthread_mutex_unlock(&g_ipc_tx_mu);
-        printf("[server] server_tx disconnected\n");
+      }
+    } else {
+      if (elapsed_ns > 5000000000ULL) { /* 5 seconds handshake timeout */
+        session_free(i);
+      }
     }
-    close(lfd);
-    return NULL;
+  }
 }
 
-static int make_ipc_server(const char *path)
-{
-    unlink(path);
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) { perror("socket(ipc)"); return -1; }
-    struct sockaddr_un a = {0};
-    a.sun_family = AF_UNIX;
-    strncpy(a.sun_path, path, sizeof(a.sun_path)-1);
-    if (bind(fd, (struct sockaddr *)&a, sizeof(a)) < 0) {
-        perror("bind(ipc)"); close(fd); return -1;
+int main(void) {
+  signal(SIGINT, on_signal);
+  signal(SIGTERM, on_signal);
+  signal(SIGPIPE, SIG_IGN);
+
+  /* Pin main network thread to Core 0 */
+  cpu_set_t cpuset;
+  CPU_ZERO(&cpuset);
+  CPU_SET(0, &cpuset);
+  sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
+
+  char ts[16];
+  now_hms(ts, sizeof(ts));
+  printf("[%s] High-Performance Asynchronous io_uring PQC Server\n", ts);
+  printf("  Protocol : ML-KEM-768 + ML-DSA-65 + ChaCha20-Poly1305\n");
+  printf("  Address  : 0.0.0.0:%d  |  Max clients: %d\n\n", SERVER_PORT,
+         MAX_CLIENTS);
+
+  registry_init();
+
+  /* Generate identity keypairs */
+  double dsa_t0 = now_ms();
+  if (dsa_keypair(g_srv_dsa_pk, g_srv_dsa_sk) != 0) {
+    fprintf(stderr, "[server] DSA keygen failed\n");
+    return 1;
+  }
+  g_dsa_keygen_ms = now_ms() - dsa_t0;
+
+  /* Ephemeral KEM keypair generation removed (dead field) */
+
+  /* Warm up cryptographic operations on the server */
+  {
+    uint8_t d_kem_pk[KEM_PK_BYTES], d_kem_sk[KEM_SK_BYTES];
+    uint8_t d_kem_ct[KEM_CT_BYTES], d_kem_ss[KEM_SS_BYTES];
+    uint8_t d_dsa_pk[DSA_PK_BYTES], d_dsa_sk[DSA_SK_BYTES];
+    uint8_t d_sig[DSA_SIG_BYTES];
+    size_t d_siglen = 0;
+    uint8_t d_ctx[64] = {0};
+
+    kem_keypair(d_kem_pk, d_kem_sk);
+    kem_enc(d_kem_ct, d_kem_ss, d_kem_pk);
+    kem_dec(d_kem_ss, d_kem_ct, d_kem_sk);
+
+    dsa_keypair(d_dsa_pk, d_dsa_sk);
+    dsa_sign(d_sig, &d_siglen, d_ctx, sizeof(d_ctx), d_dsa_sk);
+    dsa_verify(d_sig, d_siglen, d_ctx, sizeof(d_ctx), d_dsa_pk);
+  }
+
+  printf("  DSA keygen : %.3f ms (long-term identity)\n", g_dsa_keygen_ms);
+
+  /* Initialize session allocations */
+  for (int i = 0; i < MAX_SESSIONS; i++) {
+    g_sessions[i].state = SESSION_FREE;
+    g_sessions[i].generation = 0;
+    g_free_sessions[i] = (uint32_t)i;
+    memcpy(g_sessions[i].auth_ctx + SESSION_ID_BYTES, g_srv_dsa_pk,
+           DSA_PK_BYTES);
+  }
+  memset(g_session_hash, 0, sizeof(g_session_hash));
+  memset(g_rate_limit_table, 0, sizeof(g_rate_limit_table));
+
+  /* Initialize queues */
+  memset(&g_job_queue, 0, sizeof(g_job_queue));
+  memset(&g_comp_queue, 0, sizeof(g_comp_queue));
+  sem_init(&g_job_sem, 0, 0);
+
+  /* Spawn Crypto Worker Threads (Cores 1-3) */
+  for (int i = 0; i < NUM_WORKERS; i++) {
+    pthread_t tid;
+    pthread_create(&tid, NULL, crypto_worker_thread, (void *)(intptr_t)(1 + i));
+    pthread_detach(tid);
+  }
+  printf("  Crypto workers: %d threads spawned (pinned to Cores 1-3)\n",
+         NUM_WORKERS);
+
+  /* Start IPC servers */
+  {
+    int rx_lfd = make_ipc_server(IPC_RX_PATH);
+    int tx_lfd = make_ipc_server(IPC_TX_PATH);
+    if (rx_lfd < 0 || tx_lfd < 0)
+      return 1;
+    printf("  IPC RX : %s\n  IPC TX : %s\n\n", IPC_RX_PATH, IPC_TX_PATH);
+
+    int *rp = malloc(sizeof(int));
+    *rp = rx_lfd;
+    int *tp = malloc(sizeof(int));
+    *tp = tx_lfd;
+    pthread_t rt, tt;
+    pthread_create(&rt, NULL, ipc_rx_accept_thread, rp);
+    pthread_create(&tt, NULL, ipc_tx_accept_thread, tp);
+    pthread_detach(rt);
+    pthread_detach(tt);
+  }
+
+  /* Initialize io_uring */
+  g_listen_sock = make_server_sock();
+  if (g_listen_sock < 0)
+    return 1;
+
+  struct io_uring_params params;
+  memset(&params, 0, sizeof(params));
+  if (io_uring_queue_init_params(2048, &g_ring, &params) < 0) {
+    perror("io_uring_queue_init");
+    return 1;
+  }
+
+  /* Submit initial receives */
+  for (int i = 0; i < NUM_RECV_BUFFERS; i++) {
+    g_recv_bufs[i].idx = i;
+    g_recv_bufs[i].iov.iov_base = g_recv_bufs[i].buffer;
+    g_recv_bufs[i].iov.iov_len = sizeof(g_recv_bufs[i].buffer);
+    g_recv_bufs[i].msg.msg_name = &g_recv_bufs[i].peer_addr;
+    g_recv_bufs[i].msg.msg_namelen = sizeof(g_recv_bufs[i].peer_addr);
+    g_recv_bufs[i].msg.msg_iov = &g_recv_bufs[i].iov;
+    g_recv_bufs[i].msg.msg_iovlen = 1;
+    submit_recv_request(i);
+  }
+  io_uring_submit(&g_ring);
+
+  printf("\033[1;32m╔══════════════════════════════════════════╗\033[0m\n");
+  printf("\033[1;32m║  PQC Server — Multi-Client Mode          ║\033[0m\n");
+  printf("\033[1;32m║  Run: ./server_rx  (receiver terminal)   ║\033[0m\n");
+  printf("\033[1;32m║  Run: ./server_tx  (sender terminal)     ║\033[0m\n");
+  printf("\033[1;32m╚══════════════════════════════════════════╝\033[0m\n\n");
+
+  /* ── Main Network Event Loop ─────────────────────────────────── */
+  int main_idle_spin = 0;
+  while (!g_stop) {
+    int worked = 0;
+    /* 1. Process worker completions */
+    crypto_completion_t comp;
+    while (pop_completion(&comp) == 0) {
+      process_completion(&comp);
+      worked = 1;
     }
-    if (listen(fd, 4) < 0) {
-        perror("listen(ipc)"); close(fd); return -1;
-    }
-    return fd;
-}
 
-/* ════════════════════════════════════════════════════════════════════
- * main() — accept / dispatch loop
- *
- * Reads every datagram from the single shared UDP socket.
- * Routes it to the correct client pipe (or spawns a new session).
- * ════════════════════════════════════════════════════════════════════ */
-int main(void)
-{
-    signal(SIGINT,  on_signal);
-    signal(SIGTERM, on_signal);
-    signal(SIGPIPE, SIG_IGN);
+    /* 2. Poll io_uring CQ (non-blocking) */
+    struct io_uring_cqe *cqe;
+    unsigned head;
+    int count = 0;
+    io_uring_for_each_cqe(&g_ring, head, cqe) {
+      int res = cqe->res;
+      int buf_idx = (int)(intptr_t)io_uring_cqe_get_data(cqe);
 
-    memset(g_pipes, 0, sizeof(g_pipes));
-    for (int i = 0; i < DISPATCH_PIPE_MAX; i++)
-        pthread_mutex_init(&g_pipes[i].mu, NULL);
+      if (res >= PKT_HDR_BYTES) {
+        uint8_t *pkt = g_recv_bufs[buf_idx].buffer;
+        uint16_t pkt_len = (uint16_t)res;
+        struct sockaddr_in *peer = &g_recv_bufs[buf_idx].peer_addr;
+        uint32_t ip = peer->sin_addr.s_addr;
+        uint16_t port = peer->sin_port;
 
-    char ts[16]; now_hms(ts, sizeof(ts));
-    printf("[%s] PQC Multi-Client Chat Server\n", ts);
-    printf("  Protocol : ML-KEM-768 + ML-DSA-65 + ChaCha20-Poly1305\n");
-    printf("  Address  : 0.0.0.0:%d  |  Max clients: %d\n\n",
-           SERVER_PORT, MAX_CLIENTS);
+        pkt_hdr_t hdr;
+        memcpy(&hdr, pkt, PKT_HDR_BYTES);
+        hdr.seq = ntohl(hdr.seq);
+        hdr.len = ntohs(hdr.len);
+        uint8_t *payload = pkt + PKT_HDR_BYTES;
+        uint16_t payload_len = pkt_len - PKT_HDR_BYTES;
 
-    registry_init();
+        int s_idx = session_hash_lookup(ip, port);
+        if (s_idx < 0) {
+          if (hdr.type == PKT_CLIENT_HELLO) {
+            if (rate_limit_check(ip)) {
+              unsigned long queue_load =
+                  g_job_queue.tail -
+                  __atomic_load_n(&g_job_queue.head, __ATOMIC_ACQUIRE);
+              if (queue_load >= 3600) {
+                static uint64_t last_busy_ns = 0;
+                uint64_t now = now_ns();
+                if (now - last_busy_ns > 10000000ULL) {
+                  last_busy_ns = now;
+                  server_send_packet(g_listen_sock, peer, 0, PKT_BUSY, NULL, 0);
+                }
+              } else if (queue_load >= 800) {
+                server_send_packet(g_listen_sock, peer, 0, PKT_BUSY, NULL, 0);
+              } else {
+                if (payload_len >= KEM_PK_BYTES + DSA_PK_BYTES) {
+                  s_idx = session_alloc(ip, port);
+                  if (s_idx >= 0) {
+                    /* server_send_ack(g_listen_sock, peer, hdr.seq); */
+                    session_t *s = &g_sessions[s_idx];
+                    s->state = SESSION_WAIT_KEM_ENC;
+                    s->last_seen_ns = now_ns();
+                    s->current_job_id++;
 
-    /* Warmup */
-    { double wu = now_ms(); kem_warmup(); dsa_warmup();
-      printf("  [warmup] %.2f ms\n\n", now_ms() - wu); }
+                    memcpy(s->client_kem_pk, payload, KEM_PK_BYTES);
+                    memcpy(s->client_dsa_pk, payload + KEM_PK_BYTES,
+                           DSA_PK_BYTES);
 
-    /* Parallel DSA + KEM keygen */
-    {
-        pthread_t dt, kt;
-        pthread_create(&dt, NULL, dsa_keygen_thread, NULL);
-        pthread_create(&kt, NULL, kem_keygen_thread, NULL);
-        g_listen_sock = make_server_sock();
-        if (g_listen_sock < 0) return 1;
-        pthread_join(dt, NULL);
-        pthread_join(kt, NULL);
-    }
-    printf("  DSA keygen : %.3f ms (long-term identity)\n", g_dsa_keygen_ms);
-    printf("  KEM keygen : %.3f ms (first session pre-cached)\n\n",
-           g_kem_keygen_ms);
+                    crypto_job_t job;
+                    job.job_id = s->current_job_id;
+                    job.session_id = (uint32_t)s_idx;
+                    job.generation = s->generation;
+                    job.type = PKT_CLIENT_HELLO;
+                    job.client_kem_pk = s->client_kem_pk;
+                    job.client_dsa_pk = s->client_dsa_pk;
+                    job.sig = NULL;
+                    job.sig_len = 0;
+                    job.auth_ctx = NULL;
+                    job.kem_ct = s->kem_ct;
+                    job.session_key = s->session_key;
 
-    /* IPC servers */
-    {
-        int rx_lfd = make_ipc_server(IPC_RX_PATH);
-        int tx_lfd = make_ipc_server(IPC_TX_PATH);
-        if (rx_lfd < 0 || tx_lfd < 0) return 1;
-        printf("  IPC RX : %s\n  IPC TX : %s\n\n", IPC_RX_PATH, IPC_TX_PATH);
-
-        int *rp = malloc(sizeof(int)); *rp = rx_lfd;
-        int *tp = malloc(sizeof(int)); *tp = tx_lfd;
-        pthread_t rt, tt;
-        pthread_create(&rt, NULL, ipc_rx_accept_thread, rp);
-        pthread_create(&tt, NULL, ipc_tx_accept_thread, tp);
-        pthread_detach(rt);
-        pthread_detach(tt);
-    }
-
-    printf("\033[1;32m╔══════════════════════════════════════════╗\033[0m\n");
-    printf("\033[1;32m║  PQC Server — Multi-Client Mode          ║\033[0m\n");
-    printf("\033[1;32m║  Run: ./server_rx  (receiver terminal)   ║\033[0m\n");
-    printf("\033[1;32m║  Run: ./server_tx  (sender terminal)     ║\033[0m\n");
-    printf("\033[1;32m╚══════════════════════════════════════════╝\033[0m\n\n");
-
-    /*
-     * Main dispatch loop.
-     *
-     * Reads every datagram from the shared listen socket.
-     * - If it matches an active client's (ip, port): write to their pipe.
-     * - If it's a PKT_CLIENT_HELLO from a new peer: allocate a pipe and
-     *   spawn a session_thread.
-     * - Otherwise: discard.
-     *
-     * This is the ONLY thread that ever calls recvfrom() on the shared
-     * socket, so there are no races on the receive side.
-     */
-    uint8_t raw[PKT_HDR_BYTES + PIPE_PKT_MAX];
-
-    while (!g_stop) {
-        struct pollfd pfd = { .fd = g_listen_sock, .events = POLLIN };
-        if (poll(&pfd, 1, 500) <= 0) continue;
-
-        struct sockaddr_in from;
-        socklen_t from_len = sizeof(from);
-
-        ssize_t n = recvfrom(g_listen_sock, raw, sizeof(raw), 0,
-                             (struct sockaddr *)&from, &from_len);
-        if (n < (ssize_t)PKT_HDR_BYTES) continue;
-
-        uint32_t from_ip   = from.sin_addr.s_addr;
-        uint16_t from_port = from.sin_port;  /* network byte order */
-
-        /* ── Route to existing client pipe ───────────────────── */
-        int routed = 0;
-        pthread_mutex_lock(&g_pipes_mu);
-        for (int i = 0; i < DISPATCH_PIPE_MAX; i++) {
-            if (g_pipes[i].used &&
-                g_pipes[i].ip   == from_ip &&
-                g_pipes[i].port == from_port) {
-                dispatch_write(g_pipes[i].write_fd, raw, (uint16_t)n);
-                routed = 1;
-                break;
+                    if (push_job(&job) != 0) {
+                      session_free(s_idx);
+                    }
+                  }
+                }
+              }
             }
+          }
+        } else {
+          session_t *s = &g_sessions[s_idx];
+          s->last_seen_ns = now_ns();
+
+          if (hdr.type == PKT_CLIENT_HELLO) {
+            if (s->state == SESSION_WAIT_KEM_ENC) {
+              /* server_send_ack(g_listen_sock, peer, hdr.seq); */
+            } else if (s->state == SESSION_WAIT_AUTH ||
+                       s->state == SESSION_ESTABLISHED) {
+              struct iovec iovs[3];
+              iovs[0].iov_base = g_srv_dsa_pk;
+              iovs[0].iov_len = DSA_PK_BYTES;
+              iovs[1].iov_base = s->kem_ct;
+              iovs[1].iov_len = KEM_CT_BYTES;
+
+              uint8_t sid_buf[SESSION_ID_BYTES];
+              uint64_t sid64 = s->session_id_val;
+              for (int k = 0; k < SESSION_ID_BYTES; k++) {
+                sid_buf[k] = (sid64 >> ((SESSION_ID_BYTES - 1 - k) * 8)) & 0xFF;
+              }
+              iovs[2].iov_base = sid_buf;
+              iovs[2].iov_len = SESSION_ID_BYTES;
+
+              /* server_send_ack(g_listen_sock, peer, hdr.seq); */
+              server_send_packet_zero_copy(g_listen_sock, peer, s->tx_seq,
+                                           PKT_SERVER_HELLO, iovs, 3);
+            }
+          } else if (hdr.type == PKT_CLIENT_AUTH) {
+            if (s->state == SESSION_WAIT_AUTH) {
+              server_send_ack(g_listen_sock, peer, hdr.seq);
+              if (payload_len >= DSA_SIG_BYTES) {
+                s->state = SESSION_WAIT_AUTH_VER;
+                s->current_job_id++;
+
+                memcpy(s->sig, payload, DSA_SIG_BYTES);
+
+                uint64_t sid64 = s->session_id_val;
+                for (int k = 0; k < SESSION_ID_BYTES; k++) {
+                  s->auth_ctx[k] =
+                      (sid64 >> ((SESSION_ID_BYTES - 1 - k) * 8)) & 0xFF;
+                }
+                memcpy(s->auth_ctx + SESSION_ID_BYTES + DSA_PK_BYTES,
+                       s->session_key, KEM_SS_BYTES);
+
+                crypto_job_t job;
+                job.job_id = s->current_job_id;
+                job.session_id = (uint32_t)s_idx;
+                job.generation = s->generation;
+                job.type = PKT_CLIENT_AUTH;
+                job.client_kem_pk = NULL;
+                job.client_dsa_pk = s->client_dsa_pk;
+                job.sig = s->sig;
+                job.sig_len = DSA_SIG_BYTES;
+                job.auth_ctx = s->auth_ctx;
+                job.kem_ct = NULL;
+                job.session_key = NULL;
+
+                if (push_job(&job) != 0) {
+                  session_free(s_idx);
+                }
+              }
+            } else if (s->state == SESSION_WAIT_AUTH_VER ||
+                       s->state == SESSION_ESTABLISHED) {
+              server_send_ack(g_listen_sock, peer, hdr.seq);
+            }
+          } else if (hdr.type == PKT_DATA) {
+            if (s->state == SESSION_ESTABLISHED && hdr.seq > s->rx_seq) {
+              if (payload_len >= 12 + 16) {
+                const uint8_t *nonce = payload;
+                const uint8_t *tag = payload + 12;
+                const uint8_t *ct = payload + 28;
+                int ct_len = (int)payload_len - 28;
+                if (ct_len > DATA_CHUNK_MAX) {
+                  continue; /* Prevent stack buffer overflow */
+                }
+
+                uint8_t plaintext[DATA_CHUNK_MAX];
+                double dec_t0 = now_ms();
+                int pt_len = aead_decrypt(ct, ct_len, s->session_key, nonce,
+                                          tag, plaintext);
+                double dec_us = (now_ms() - dec_t0) * 1000.0;
+
+                if (pt_len >= 0) {
+                  s->rx_seq = hdr.seq;
+                  s->metrics.bytes_recv += pkt_len;
+                  s->metrics.msg_count++;
+                  s->metrics.total_decrypt_us += dec_us;
+                  s->metrics.decrypt_count++;
+
+                  metrics_t *rm = registry_get_metrics(s->client_registry_id);
+                  if (rm) {
+                    rm->bytes_recv = s->metrics.bytes_recv;
+                    rm->msg_count = s->metrics.msg_count;
+                    rm->total_decrypt_us = s->metrics.total_decrypt_us;
+                    rm->decrypt_count = s->metrics.decrypt_count;
+                  }
+
+                  char ip_str[16];
+                  inet_ntop(AF_INET, &peer->sin_addr, ip_str, sizeof(ip_str));
+                  uint16_t rport = ntohs(peer->sin_port);
+                  ipc_push_rx_msg(s->client_registry_id, ip_str, rport,
+                                  s->session_id_val, plaintext, pt_len);
+
+                  float avg_dec =
+                      (s->metrics.decrypt_count > 0)
+                          ? (float)(s->metrics.total_decrypt_us /
+                                    (double)s->metrics.decrypt_count)
+                          : 0.0f;
+                  ipc_push_rx_metrics(s->client_registry_id, (float)dec_us,
+                                      0.0f, 0.0f, avg_dec,
+                                      s->metrics.bytes_recv, hdr.seq);
+
+                  /* Echo back to client */
+                  uint8_t echo_pkt[12 + 16 + DATA_CHUNK_MAX];
+                  uint8_t echo_nonce[12];
+                  make_nonce(echo_nonce, s->tx_nonce_ctr++);
+                  memcpy(echo_pkt, echo_nonce, 12);
+
+                  int echo_ct_len = aead_encrypt(
+                      plaintext, pt_len, s->session_key, echo_nonce,
+                      echo_pkt + 12 + 16, /* ciphertext */
+                      echo_pkt + 12);     /* tag */
+                  if (echo_ct_len >= 0) {
+                    uint16_t echo_pkt_len = (uint16_t)(12 + 16 + echo_ct_len);
+                    server_send_packet(g_listen_sock, peer, s->tx_seq++,
+                                       PKT_DATA, echo_pkt, echo_pkt_len);
+                  }
+                }
+              }
+            }
+          }
         }
-        pthread_mutex_unlock(&g_pipes_mu);
-        if (routed) continue;
+      }
 
-        /* ── New client ──────────────────────────────────────── */
-        uint8_t pkt_type = raw[4];   /* type at offset 4 in pkt_hdr_t */
-        if (pkt_type != PKT_CLIENT_HELLO) continue;  /* ignore stray pkts */
-
-        if (registry_count() >= MAX_CLIENTS) {
-            char tip[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &from.sin_addr, tip, sizeof(tip));
-            fprintf(stderr, "[server] At capacity, rejecting %s\n", tip);
-            continue;
-        }
-
-        /* Allocate dispatch pipe */
-        int idx = dispatch_alloc(from_ip, from_port);
-        if (idx < 0) {
-            fprintf(stderr, "[server] dispatch_alloc failed\n");
-            continue;
-        }
-
-        /* Write the CLIENT_HELLO into the new pipe immediately */
-        dispatch_write(g_pipes[idx].write_fd, raw, (uint16_t)n);
-
-        {
-            char tip[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &from.sin_addr, tip, sizeof(tip));
-            now_hms(ts, sizeof(ts));
-            printf("[%s] New client: %s:%u  (active=%d)\n",
-                   ts, tip, ntohs(from_port), registry_count());
-        }
-
-        /* Spawn session thread */
-        session_args_t *sa = malloc(sizeof(session_args_t));
-        sa->peer     = from;
-        sa->pipe_idx = idx;
-
-        pthread_t tid;
-        pthread_attr_t attr;
-        pthread_attr_init(&attr);
-        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-        pthread_create(&tid, &attr, session_thread, sa);
-        pthread_attr_destroy(&attr);
+      submit_recv_request(buf_idx);
+      count++;
+    }
+    if (count > 0) {
+      io_uring_cq_advance(&g_ring, count);
+      io_uring_submit(&g_ring);
+      worked = 1;
     }
 
-    close(g_listen_sock);
-    unlink(IPC_RX_PATH);
-    unlink(IPC_TX_PATH);
-    explicit_bzero(g_srv_dsa_sk, sizeof(g_srv_dsa_sk));
-    explicit_bzero(g_srv_kem_sk, sizeof(g_srv_kem_sk));
-    printf("\n[server] Shutdown complete.\n");
-    return 0;
+    /* 3. Inactive Session Cleanup Sweep */
+    sweep_timeouts();
+
+    /* 4. Sleep/Yield based on CPU activity and pending worker jobs */
+    if (worked) {
+      main_idle_spin = 0;
+    } else {
+      if (++main_idle_spin > 1000) {
+        if (__atomic_load_n(&g_in_flight_jobs, __ATOMIC_ACQUIRE) == 0) {
+          struct io_uring_cqe *wait_cqe;
+          io_uring_wait_cqe(&g_ring, &wait_cqe);
+        } else {
+          struct timespec ts = {0, 10000}; // 10 us
+          nanosleep(&ts, NULL);
+        }
+        main_idle_spin = 0;
+      } else {
+        __builtin_ia32_pause();
+      }
+    }
+  }
+
+  close(g_listen_sock);
+  io_uring_queue_exit(&g_ring);
+  unlink(IPC_RX_PATH);
+  unlink(IPC_TX_PATH);
+  explicit_bzero(g_srv_dsa_sk, sizeof(g_srv_dsa_sk));
+  /* Ephemeral KEM keypair zeroization removed (dead field) */
+  sem_destroy(&g_job_sem);
+  printf("\n[server] Shutdown complete.\n");
+  return 0;
 }

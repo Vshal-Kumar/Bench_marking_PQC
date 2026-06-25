@@ -62,7 +62,7 @@ void now_hms(char *buf, int sz)
 /* ── Socket helpers ──────────────────────────────────────────────── */
 static int configure_sock(int s)
 {
-    int buf = 4 * 1024 * 1024;
+    int buf = 16 * 1024 * 1024;
     setsockopt(s, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
     setsockopt(s, SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf));
 
@@ -74,6 +74,11 @@ static int configure_sock(int s)
 
     int prio = 6;     /* highest unprivileged egress priority */
     setsockopt(s, SOL_SOCKET, SO_PRIORITY, &prio, sizeof(prio));
+
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 50000; /* 50 ms default timeout */
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     return 0;
 }
@@ -140,19 +145,15 @@ ssize_t pkt_recv(conn_t *c, pkt_hdr_t *hdr,
                  uint8_t *payload_out, size_t payload_max,
                  int timeout_us)
 {
-    if (timeout_us > 0) {
-        struct pollfd pfd = { .fd = c->sock, .events = POLLIN };
-        int ms = (timeout_us + 999) / 1000;
-        if (ms < 1) ms = 1;
-        if (poll(&pfd, 1, ms) <= 0) return -1;
-    }
-
     uint8_t raw[PKT_BUF_MAX];
     struct sockaddr_in from = {0};
     socklen_t from_len = sizeof(from);
+    ssize_t n = -1;
 
-    ssize_t n = recvfrom(c->sock, raw, sizeof(raw), 0,
-                         (struct sockaddr *)&from, &from_len);
+    n = recvfrom(c->sock, raw, sizeof(raw), 0,
+                 (struct sockaddr *)&from, &from_len);
+
+    if (n < 0) return -1;
     if (n < (ssize_t)PKT_HDR_BYTES) return -1;
 
     memcpy(hdr, raw, PKT_HDR_BYTES);
@@ -191,7 +192,10 @@ int pkt_send_reliable(conn_t *c, uint8_t type,
     for (int attempt = 0; attempt < RETX_MAX; attempt++) {
         if (attempt > 0) c->tx_seq = our_seq;
 
-        pkt_send(c, type, payload, payload_len);
+        if (pkt_send(c, type, payload, payload_len) < 0) {
+            usleep(1000);
+            continue;
+        }
 
         pkt_hdr_t hdr;
         uint8_t   buf[256];
@@ -202,7 +206,13 @@ int pkt_send_reliable(conn_t *c, uint8_t type,
             if (remaining_us <= 0) break;
 
             ssize_t n = pkt_recv(c, &hdr, buf, sizeof(buf), remaining_us);
-            if (n < 0) break;
+            if (n < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    __builtin_ia32_pause();
+                    continue;
+                }
+                break;
+            }
 
             if (hdr.type == PKT_ACK && n >= 4) {
                 uint32_t acked = ((uint32_t)buf[0] << 24)
@@ -288,7 +298,7 @@ ssize_t data_recv(conn_t *c, uint8_t *out, size_t out_max)
         const uint8_t *tag   = raw + 12;
         const uint8_t *ct    = raw + 28;
         int ct_len = (int)n - 28;
-        if (ct_len <= 0) continue;
+        if (ct_len <= 0 || ct_len > DATA_CHUNK_MAX || (size_t)ct_len > out_max) continue;
 
         int pt_len = aead_decrypt(ct, ct_len, c->session_key, nonce, tag, out);
         if (pt_len < 0) {

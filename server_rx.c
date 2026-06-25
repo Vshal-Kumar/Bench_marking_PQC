@@ -65,7 +65,7 @@ static volatile int g_stop = 0;
 static void on_signal(int s) { (void)s; g_stop = 1; }
 
 /* ── Tracked per-client state (for multi-line display) ───────────── */
-#define MAX_TRACKED 32
+#define MAX_TRACKED MAX_CLIENTS
 typedef struct {
     int      client_id;
     char     ip_str[INET_ADDRSTRLEN];

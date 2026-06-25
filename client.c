@@ -175,7 +175,6 @@ static int do_handshake(conn_t *c, metrics_t *m,
     double t0, t1;
     double hs_start = now_ms();
 
-    uint8_t srv_kem_pk[KEM_PK_BYTES];
     uint8_t srv_dsa_pk[DSA_PK_BYTES];
     uint8_t kem_ct[KEM_CT_BYTES];
     uint8_t shared_secret[KEM_SS_BYTES];
@@ -196,19 +195,17 @@ static int do_handshake(conn_t *c, metrics_t *m,
     printf("  CLIENT_HELLO sent (%zu bytes)\n", sizeof(hello));
 
     /* Phase 2: Receive SERVER_HELLO */
-    size_t srv_hello_min = KEM_PK_BYTES + DSA_PK_BYTES + KEM_CT_BYTES + SESSION_ID_BYTES;
-    uint8_t srv_hello[KEM_PK_BYTES + DSA_PK_BYTES + KEM_CT_BYTES + SESSION_ID_BYTES + 32];
+    size_t srv_hello_min = DSA_PK_BYTES + KEM_CT_BYTES + SESSION_ID_BYTES;
+    uint8_t srv_hello[DSA_PK_BYTES + KEM_CT_BYTES + SESSION_ID_BYTES + 32];
     ssize_t srv_len = recv_type(c, PKT_SERVER_HELLO, srv_hello, sizeof(srv_hello));
     if (srv_len < (ssize_t)srv_hello_min) {
         fprintf(stderr, "[client] SERVER_HELLO too short\n"); return -1;
     }
     {
         size_t off = 0;
-        memcpy(srv_kem_pk, srv_hello + off, KEM_PK_BYTES);    off += KEM_PK_BYTES;
         memcpy(srv_dsa_pk, srv_hello + off, DSA_PK_BYTES);    off += DSA_PK_BYTES;
         memcpy(kem_ct,     srv_hello + off, KEM_CT_BYTES);    off += KEM_CT_BYTES;
         memcpy(session_id, srv_hello + off, SESSION_ID_BYTES);
-        (void)srv_kem_pk;
     }
     printf("  SERVER_HELLO received (%zu bytes)\n", (size_t)srv_len);
 
@@ -220,6 +217,11 @@ static int do_handshake(conn_t *c, metrics_t *m,
     t1 = now_ms();
     m->hs_encap_ms = t1 - t0;
     printf("  kem_decaps          : %.3f ms\n", m->hs_encap_ms);
+
+    /* Derive key using KDF (SHAKE-256) */
+    uint8_t derived_key[DERIVED_KEY_BYTES];
+    kem_derive_key(derived_key, shared_secret);
+    memcpy(shared_secret, derived_key, KEM_SS_BYTES);
 
     /* DSA sign */
     uint8_t auth_ctx[AUTH_CTX_LEN];

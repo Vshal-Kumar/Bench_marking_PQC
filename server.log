@@ -1,0 +1,158 @@
+[16:35:38.950] High-Performance Asynchronous io_uring PQC Server
+  Protocol : ML-KEM-768 + ML-DSA-65 + ChaCha20-Poly1305
+  Address  : 0.0.0.0:9877  |  Max clients: 4096
+
+  DSA keygen : 1.668 ms (long-term identity)
+  Crypto workers: 3 threads spawned (pinned to Cores 1-3)
+  IPC RX : /tmp/pqc_rx.sock
+  IPC TX : /tmp/pqc_tx.sock
+
+[1;32m╔══════════════════════════════════════════╗[0m
+[1;32m║  PQC Server — Multi-Client Mode          ║[0m
+[1;32m║  Run: ./server_rx  (receiver terminal)   ║[0m
+[1;32m║  Run: ./server_tx  (sender terminal)     ║[0m
+[1;32m╚══════════════════════════════════════════╝[0m
+
+[16:35:45.113] [1;32m✓ CLIENT-01[0m  127.0.0.1:57886  SID=4028b3bed727a82a  HS=23.284ms  Active=1
+
+[16:35:45.113] [1;32m✓ CLIENT-02[0m  127.0.0.1:48915  SID=ec41484f67ef593e  HS=23.590ms  Active=2
+
+[16:35:45.113] [1;32m✓ CLIENT-03[0m  127.0.0.1:60961  SID=4bf350867b97b53f  HS=23.563ms  Active=3
+
+[16:35:45.113] [1;32m✓ CLIENT-04[0m  127.0.0.1:53376  SID=da4679d6d0768e89  HS=22.744ms  Active=4
+
+[16:35:45.113] [1;32m✓ CLIENT-05[0m  127.0.0.1:54566  SID=ca21be50573df70a  HS=22.700ms  Active=5
+
+[16:35:45.113] [1;32m✓ CLIENT-06[0m  127.0.0.1:33690  SID=465848a95d04bd5b  HS=22.040ms  Active=6
+
+[16:35:45.113] [1;32m✓ CLIENT-07[0m  127.0.0.1:37316  SID=181debd0012cf69a  HS=21.993ms  Active=7
+
+[16:35:45.113] [1;32m✓ CLIENT-08[0m  127.0.0.1:45620  SID=0bb0157a2a142c6c  HS=21.966ms  Active=8
+
+[16:35:45.113] [1;32m✓ CLIENT-09[0m  127.0.0.1:35786  SID=fb886f112ea826c8  HS=21.345ms  Active=9
+
+[16:35:45.113] [1;32m✓ CLIENT-10[0m  127.0.0.1:45385  SID=40d87dcd989921ff  HS=21.318ms  Active=10
+
+[16:35:45.113] [1;32m✓ CLIENT-11[0m  127.0.0.1:53116  SID=f5b0e57c67c9a9f9  HS=21.291ms  Active=11
+
+[16:35:45.113] [1;32m✓ CLIENT-12[0m  127.0.0.1:53194  SID=de1e4528a5e3aa8b  HS=21.258ms  Active=12
+
+[16:35:45.113] [1;32m✓ CLIENT-13[0m  127.0.0.1:53060  SID=1fee7766b3b30894  HS=19.841ms  Active=13
+
+[16:35:45.113] [1;32m✓ CLIENT-14[0m  127.0.0.1:40063  SID=e982058660a91910  HS=19.813ms  Active=14
+
+[16:35:45.113] [1;32m✓ CLIENT-15[0m  127.0.0.1:58125  SID=92f48ca3e0ea3eca  HS=19.782ms  Active=15
+
+[16:35:45.113] [1;32m✓ CLIENT-16[0m  127.0.0.1:56439  SID=477ba0d23004c3ce  HS=19.255ms  Active=16
+
+[16:35:45.113] [1;32m✓ CLIENT-17[0m  127.0.0.1:41565  SID=2bb6c7e9570095d2  HS=19.227ms  Active=17
+
+[16:35:45.113] [1;32m✓ CLIENT-18[0m  127.0.0.1:34812  SID=53a2cd54d72f2041  HS=19.199ms  Active=18
+
+[16:35:45.113] [1;32m✓ CLIENT-19[0m  127.0.0.1:50443  SID=ba84984f2ea6e910  HS=18.567ms  Active=19
+
+[16:35:45.113] [1;32m✓ CLIENT-20[0m  127.0.0.1:53874  SID=fd910ad9ae7475cd  HS=18.537ms  Active=20
+
+[16:35:45.113] [1;32m✓ CLIENT-21[0m  127.0.0.1:55750  SID=cc749a04c7fe53f1  HS=18.022ms  Active=21
+
+[16:35:45.114] [1;32m✓ CLIENT-22[0m  127.0.0.1:59571  SID=96ba67c65aec7764  HS=17.998ms  Active=22
+
+[16:35:45.114] [1;32m✓ CLIENT-23[0m  127.0.0.1:43798  SID=51f9ab0c88273cd3  HS=17.493ms  Active=23
+
+[16:35:45.114] [1;32m✓ CLIENT-24[0m  127.0.0.1:51334  SID=e6d20425b245a99a  HS=17.466ms  Active=24
+
+[16:35:45.114] [1;32m✓ CLIENT-25[0m  127.0.0.1:48836  SID=b1cea06a9c2c4e5b  HS=17.440ms  Active=25
+
+[16:35:45.114] [1;32m✓ CLIENT-26[0m  127.0.0.1:45118  SID=a857ab7fc564fcca  HS=16.928ms  Active=26
+
+[16:35:45.114] [1;32m✓ CLIENT-27[0m  127.0.0.1:50111  SID=5e0830eba3895c3b  HS=16.891ms  Active=27
+
+[16:35:45.114] [1;32m✓ CLIENT-28[0m  127.0.0.1:55224  SID=fffa91da1fec5166  HS=16.845ms  Active=28
+
+[16:35:45.114] [1;32m✓ CLIENT-29[0m  127.0.0.1:41681  SID=62f0a16353f83e89  HS=16.822ms  Active=29
+
+[16:35:45.114] [1;32m✓ CLIENT-30[0m  127.0.0.1:42312  SID=025adc1193212182  HS=16.226ms  Active=30
+
+[16:35:45.114] [1;32m✓ CLIENT-31[0m  127.0.0.1:41135  SID=949bc7b8761ba84d  HS=16.196ms  Active=31
+
+[16:35:45.114] [1;32m✓ CLIENT-32[0m  127.0.0.1:57050  SID=2e29349455633552  HS=15.694ms  Active=32
+
+[16:35:45.114] [1;32m✓ CLIENT-33[0m  127.0.0.1:51453  SID=063feb90c093f7bc  HS=15.716ms  Active=33
+
+[16:35:45.114] [1;32m✓ CLIENT-34[0m  127.0.0.1:54830  SID=6308ae2958b90185  HS=15.690ms  Active=34
+
+[16:35:45.114] [1;32m✓ CLIENT-35[0m  127.0.0.1:45940  SID=86323c0f7937d7fd  HS=15.170ms  Active=35
+
+[16:35:45.114] [1;32m✓ CLIENT-36[0m  127.0.0.1:34150  SID=aeb9108bdbb442e5  HS=15.139ms  Active=36
+
+[16:35:45.114] [1;32m✓ CLIENT-37[0m  127.0.0.1:34132  SID=a9b1731ab919ce41  HS=15.105ms  Active=37
+
+[16:35:45.114] [1;32m✓ CLIENT-38[0m  127.0.0.1:38654  SID=003538c54f15cb27  HS=14.546ms  Active=38
+
+[16:35:45.114] [1;32m✓ CLIENT-39[0m  127.0.0.1:39349  SID=4e618c697d78a5b9  HS=14.523ms  Active=39
+
+[16:35:45.114] [1;32m✓ CLIENT-40[0m  127.0.0.1:46051  SID=6169bafa47f7c9cd  HS=14.500ms  Active=40
+
+[16:35:45.114] [1;32m✓ CLIENT-41[0m  127.0.0.1:45322  SID=8af8d1136b26acd9  HS=14.469ms  Active=41
+
+[16:35:45.114] [1;32m✓ CLIENT-42[0m  127.0.0.1:43437  SID=6055c777f09af470  HS=13.827ms  Active=42
+
+[16:35:45.114] [1;32m✓ CLIENT-43[0m  127.0.0.1:35598  SID=6bc4f03d2ea92a4a  HS=13.794ms  Active=43
+
+[16:35:45.114] [1;32m✓ CLIENT-44[0m  127.0.0.1:44919  SID=856c42a4c399c890  HS=13.769ms  Active=44
+
+[16:35:45.114] [1;32m✓ CLIENT-45[0m  127.0.0.1:48602  SID=f65aeb7d7fdcd610  HS=13.220ms  Active=45
+
+[16:35:45.114] [1;32m✓ CLIENT-46[0m  127.0.0.1:57479  SID=763803c5a76c9de1  HS=13.193ms  Active=46
+
+[16:35:45.114] [1;32m✓ CLIENT-47[0m  127.0.0.1:49557  SID=f173a35d21ac302f  HS=13.167ms  Active=47
+
+[16:35:45.114] [1;32m✓ CLIENT-48[0m  127.0.0.1:37304  SID=8bc2d1c1a686f91b  HS=13.140ms  Active=48
+
+[16:35:45.114] [1;32m✓ CLIENT-49[0m  127.0.0.1:53718  SID=ab37bd943f8b0f0b  HS=12.455ms  Active=49
+
+[16:35:45.114] [1;32m✓ CLIENT-50[0m  127.0.0.1:55116  SID=79c2b612f9b79b69  HS=12.414ms  Active=50
+
+[16:35:45.114] [1;32m✓ CLIENT-51[0m  127.0.0.1:59318  SID=434da57719932dda  HS=12.394ms  Active=51
+
+[16:35:45.114] [1;32m✓ CLIENT-52[0m  127.0.0.1:34944  SID=4c8d140be41e88bc  HS=12.365ms  Active=52
+
+[16:35:45.114] [1;32m✓ CLIENT-53[0m  127.0.0.1:59428  SID=6b91683ede47bd76  HS=12.335ms  Active=53
+
+[16:35:45.114] [1;32m✓ CLIENT-54[0m  127.0.0.1:60715  SID=79c4d695d5520547  HS=11.511ms  Active=54
+
+[16:35:45.114] [1;32m✓ CLIENT-55[0m  127.0.0.1:54191  SID=def9bd50cecf749b  HS=11.480ms  Active=55
+
+[16:35:45.114] [1;32m✓ CLIENT-56[0m  127.0.0.1:59004  SID=9953d35508731cee  HS=11.447ms  Active=56
+
+[16:35:45.114] [1;32m✓ CLIENT-57[0m  127.0.0.1:44881  SID=0ad85a99c383f31f  HS=10.886ms  Active=57
+
+[16:35:45.114] [1;32m✓ CLIENT-58[0m  127.0.0.1:55546  SID=ce8030813b1a1347  HS=10.836ms  Active=58
+
+[16:35:45.114] [1;32m✓ CLIENT-59[0m  127.0.0.1:37788  SID=9f9fbee83afe0655  HS=10.275ms  Active=59
+
+[16:35:45.114] [1;32m✓ CLIENT-60[0m  127.0.0.1:50601  SID=622cfdbae9ca0cee  HS=10.251ms  Active=60
+
+[16:35:45.114] [1;32m✓ CLIENT-61[0m  127.0.0.1:37736  SID=82a322a32bdf4a83  HS=9.665ms  Active=61
+
+[16:35:45.114] [1;32m✓ CLIENT-62[0m  127.0.0.1:37826  SID=1961bcb7f2932fc3  HS=9.634ms  Active=62
+
+[16:35:45.114] [1;32m✓ CLIENT-63[0m  127.0.0.1:50204  SID=2e549af290824e43  HS=9.609ms  Active=63
+
+[16:35:45.114] [1;32m✓ CLIENT-64[0m  127.0.0.1:55238  SID=24128fb26f4619e5  HS=9.584ms  Active=64
+
+[16:35:45.114] [1;32m✓ CLIENT-65[0m  127.0.0.1:38056  SID=fc6006ff7a036202  HS=9.065ms  Active=65
+
+[16:35:45.114] [1;32m✓ CLIENT-66[0m  127.0.0.1:60404  SID=eca175da5628f425  HS=9.036ms  Active=66
+
+[16:35:45.114] [1;32m✓ CLIENT-67[0m  127.0.0.1:37717  SID=0c11def7a9c2e96c  HS=9.011ms  Active=67
+
+[16:35:45.114] [1;32m✓ CLIENT-68[0m  127.0.0.1:44595  SID=039f34c9145e4b94  HS=8.474ms  Active=68
+
+[16:35:45.114] [1;32m✓ CLIENT-69[0m  127.0.0.1:47634  SID=ff941ccf221130c8  HS=8.451ms  Active=69
+
+[16:35:45.114] [1;32m✓ CLIENT-70[0m  127.0.0.1:50964  SID=b3ef53bcb93303d1  HS=8.428ms  Active=70
+
+[16:35:45.114] [1;32m✓ CLIENT-71[0m  127.0.0.1:50832  SID=bd0aac23a1797e27  HS=7.869ms  Active=71
+
+[16:35:45.114] [1;32m✓ C
