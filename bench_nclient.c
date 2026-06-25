@@ -40,6 +40,8 @@
 
 #define AUTH_CTX_LEN  (SESSION_ID_BYTES + DSA_PK_BYTES + KEM_SS_BYTES)
 
+static const char *g_server_ip = SERVER_ADDR;
+
 #include <sys/resource.h>
 
 /* CPU Tick Stats Structure */
@@ -262,7 +264,7 @@ static void *client_thread(void *arg)
     c.peer_len = sizeof(c.peer);
     c.peer.sin_family = AF_INET;
     c.peer.sin_port   = htons(SERVER_PORT);
-    inet_pton(AF_INET, SERVER_ADDR, &c.peer.sin_addr);
+    inet_pton(AF_INET, g_server_ip, &c.peer.sin_addr);
     c.tx_seq = 1;
 
     /* fcntl(sock, F_SETFL, O_NONBLOCK); */
@@ -430,15 +432,18 @@ int main(int argc, char *argv[])
     signal(SIGPIPE, SIG_IGN);
 
     g_num_msgs = 5; /* Handshake + 5 data messages for metrics */
-    if (argc > 2) {
-        fprintf(stderr, "Usage: %s [num_clients 1-4096]\n", argv[0]);
+    if (argc > 3) {
+        fprintf(stderr, "Usage: %s [num_clients 1-4096] [server_ip]\n", argv[0]);
         return 1;
     }
     if (argc > 1) {
         g_num_clients = atoi(argv[1]);
     }
+    if (argc > 2) {
+        g_server_ip = argv[2];
+    }
     if (g_num_clients < 1 || g_num_clients > 4096) {
-        fprintf(stderr, "Usage: %s [num_clients 1-4096]\n", argv[0]);
+        fprintf(stderr, "Usage: %s [num_clients 1-4096] [server_ip]\n", argv[0]);
         return 1;
     }
 
@@ -450,7 +455,7 @@ int main(int argc, char *argv[])
     printf("  Clients    : %d\n", g_num_clients);
     printf("  Messages   : %d per client %s\n", g_num_msgs,
            g_num_msgs == 0 ? "(handshake only)" : "");
-    printf("  Server     : %s:%d\n", SERVER_ADDR, SERVER_PORT);
+    printf("  Server     : %s:%d\n", g_server_ip, SERVER_PORT);
     printf("  Timer      : CLOCK_MONOTONIC (ns resolution)\n\n");
 
 
