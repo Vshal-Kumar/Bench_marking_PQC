@@ -3,12 +3,22 @@
 # Target architecture: ARM64 / AArch64 with NEON
 # Toolchain:           aarch64-linux-gnu-gcc
 
-CC      = aarch64-linux-gnu-gcc
-LIBOQS  = arm64_ref/liboqs/build_aarch64_simd
-OPENSSL_ARM = arm64_ref/openssl_arm64/usr/lib/aarch64-linux-gnu
+HOST_ARCH := $(shell uname -m)
 
-INC     = -I. -I$(LIBOQS)/include -Iarm64_ref/openssl_arm64/usr/include -Iarm64_ref/openssl_arm64/usr/include/aarch64-linux-gnu
-LIBS    = $(LIBOQS)/lib/liboqs.a $(OPENSSL_ARM)/libssl.a $(OPENSSL_ARM)/libcrypto.a -lpthread -lm
+ifeq ($(HOST_ARCH),aarch64)
+  # Native compilation on ARM64 Raspberry Pi
+  CC      = gcc
+  LIBOQS  = liboqs/build
+  INC     = -I. -I$(LIBOQS)/include
+  LIBS    = $(LIBOQS)/lib/liboqs.a -lssl -lcrypto -lpthread -lm
+else
+  # Cross-compilation on x86_64 host
+  CC      = aarch64-linux-gnu-gcc
+  LIBOQS  = arm64_ref/liboqs/build_aarch64_simd
+  OPENSSL_ARM = arm64_ref/openssl_arm64/usr/lib/aarch64-linux-gnu
+  INC     = -I. -I$(LIBOQS)/include -Iarm64_ref/openssl_arm64/usr/include -Iarm64_ref/openssl_arm64/usr/include/aarch64-linux-gnu
+  LIBS    = $(LIBOQS)/lib/liboqs.a $(OPENSSL_ARM)/libssl.a $(OPENSSL_ARM)/libcrypto.a -lpthread -lm
+endif
 
 OPT     = -O3 -funroll-loops -fomit-frame-pointer -fno-plt
 FAST    = $(OPT) -ffast-math
