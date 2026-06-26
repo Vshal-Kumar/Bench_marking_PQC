@@ -204,7 +204,7 @@ static ssize_t recv_type_timeout(conn_t *c, uint8_t want, uint8_t *payload,
     ssize_t n = pkt_recv(c, &hdr, payload, max, 0);
     if (n < 0) {
       if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        __builtin_ia32_pause();
+        cpu_pause();
         continue;
       }
       continue;
@@ -283,6 +283,11 @@ static void *client_thread(void *arg) {
   /* Synchronize: all clients start handshake simultaneously */
   pthread_barrier_wait(&g_start_barrier);
 
+  /* Stagger startup slightly to prevent flooding network buffer queues */
+  if (g_num_clients > 10) {
+    usleep(idx * 50); // Stagger threads by 50us (1000 threads spread over 50ms)
+  }
+
   r->start_ns = ns_now();
 
   /* ── Phase 1 & 2: CLIENT_HELLO & SERVER_HELLO (Reliable implicitly) ── */
@@ -301,7 +306,7 @@ static void *client_thread(void *arg) {
       goto fail;
 
     n = recv_type_timeout(&c, PKT_SERVER_HELLO, srv_hello, sizeof(srv_hello),
-                          50);
+                          300);
     if (n >= (ssize_t)min_len) {
       break;
     }

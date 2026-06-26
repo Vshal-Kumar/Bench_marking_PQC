@@ -372,8 +372,12 @@ typedef struct {
 } rate_limit_entry_t;
 
 static rate_limit_entry_t g_rate_limit_table[RATE_LIMIT_HASH_SIZE];
+static int g_disable_rate_limit = 0;
 
 static int rate_limit_check(uint32_t ip) {
+  if (g_disable_rate_limit) {
+    return 1;
+  }
   uint32_t host_ip = ntohl(ip);
   if ((host_ip >> 24) == 127) {
     return 1;
@@ -600,7 +604,7 @@ static void *crypto_worker_thread(void *arg) {
       }
 
       while (push_completion(&comp) != 0) {
-        __builtin_ia32_pause();
+        cpu_pause();
       }
     } else {
       if (++idle_spin > 1000) {
@@ -608,7 +612,7 @@ static void *crypto_worker_thread(void *arg) {
         sem_wait(&g_job_sem);
         idle_spin = 0;
       } else {
-        __builtin_ia32_pause();
+        cpu_pause();
       }
     }
   }
@@ -966,6 +970,14 @@ int main(void) {
   memset(g_session_hash, 0, sizeof(g_session_hash));
   memset(g_rate_limit_table, 0, sizeof(g_rate_limit_table));
 
+  char *env_rl = getenv("PQC_DISABLE_RATE_LIMIT");
+  if (env_rl && strcmp(env_rl, "1") == 0) {
+    g_disable_rate_limit = 1;
+    printf("  Rate limiting: DISABLED (via env var)\n");
+  } else {
+    printf("  Rate limiting: ENABLED (50 pkts/s, burst 20)\n");
+  }
+
   /* Initialize queues */
   memset(&g_job_queue, 0, sizeof(g_job_queue));
   memset(&g_comp_queue, 0, sizeof(g_comp_queue));
@@ -1274,7 +1286,7 @@ int main(void) {
         }
         main_idle_spin = 0;
       } else {
-        __builtin_ia32_pause();
+        cpu_pause();
       }
     }
   }

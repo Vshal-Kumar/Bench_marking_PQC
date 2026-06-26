@@ -21,13 +21,13 @@
 #include <stdint.h>
 
 /* Buffer sizes for ML-DSA-65 (FIPS 204, K=6, L=5) */
-#define DSA_PK_BYTES   1952   /* pqcrystals_dilithium3_PUBLICKEYBYTES */
-#define DSA_SK_BYTES   4032   /* pqcrystals_dilithium3_SECRETKEYBYTES */
-#define DSA_SIG_BYTES  3309   /* pqcrystals_dilithium3_BYTES          */
+#define DSA_PK_BYTES 1952  /* pqcrystals_dilithium3_PUBLICKEYBYTES */
+#define DSA_SK_BYTES 4032  /* pqcrystals_dilithium3_SECRETKEYBYTES */
+#define DSA_SIG_BYTES 3309 /* pqcrystals_dilithium3_BYTES          */
 
 /*
  * dsa_keypair() — generate a ML-DSA-65 key pair.
- * Internally calls OQS_SIG_ml_dsa_65_keeypair().
+ * Internally calls OQS_SIG_ml_dsa_65_keypair().
  * Returns 0 on success.
  */
 int dsa_keypair(uint8_t pk[DSA_PK_BYTES], uint8_t sk[DSA_SK_BYTES]);
@@ -35,20 +35,17 @@ int dsa_keypair(uint8_t pk[DSA_PK_BYTES], uint8_t sk[DSA_SK_BYTES]);
 /*
  * dsa_sign() — compute a detached ML-DSA-65 signature.
  * Internally calls OQS_SIG_ml_dsa_65_sign() (empty context string).
- * Returns 0 on success. *siglen is set to the actual signature length.e
+ * Returns 0 on success. *siglen is set to the actual signature length.
  */
-int dsa_sign(uint8_t sig[DSA_SIG_BYTES],
-             size_t *siglen,
-             const uint8_t *m, size_t mlen,
-             const uint8_t sk[DSA_SK_BYTES]);
+int dsa_sign(uint8_t sig[DSA_SIG_BYTES], size_t *siglen, const uint8_t *m,
+             size_t mlen, const uint8_t sk[DSA_SK_BYTES]);
 
 /*
  * dsa_verify() — verify a detached ML-DSA-65 signature.
  * Internally calls OQS_SIG_ml_dsa_65_verify() (empty context string).
  * Returns 0 if valid, non-zero otherwise.
  */
-int dsa_verify(const uint8_t *sig, size_t siglen,
-               const uint8_t *m,   size_t mlen,
+int dsa_verify(const uint8_t *sig, size_t siglen, const uint8_t *m, size_t mlen,
                const uint8_t pk[DSA_PK_BYTES]);
 
 /*
